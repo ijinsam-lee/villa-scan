@@ -1,0 +1,5 @@
+# API 키와 개인 파일은 올리지 않음
+.streamlit/secrets.toml
+geocode_cache.json
+__pycache__/
+*.bat
