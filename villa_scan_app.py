@@ -1076,8 +1076,11 @@ with print_slot:
     with p1:
         import streamlit.components.v1 as components
         components.html(f"""
-<button id="pbtn" style="width:100%;height:38px;border:1px solid #d0d4da;border-radius:8px;background:#fff;
-  font-size:14px;cursor:pointer;font-family:sans-serif">🖨️ 인쇄</button>
+<style>html,body{margin:0;padding:0;background:transparent}
+#pbtn{width:100%;height:40px;border:1px solid rgba(49,51,63,.2);border-radius:8px;background:#fff;color:#31333f;
+  font-size:14px;cursor:pointer;font-family:"Source Sans Pro",sans-serif;box-sizing:border-box}
+#pbtn:hover{border-color:#ff4b4b;color:#ff4b4b}</style>
+<button id="pbtn">🖨️ 인쇄</button>
 <script>
 const html = {json.dumps(report_html)};
 document.getElementById('pbtn').onclick = () => {{
@@ -1089,7 +1092,7 @@ document.getElementById('pbtn').onclick = () => {{
   w.onload = go;
   setTimeout(go, 600);
 }};
-</script>""", height=44)
+</script>""", height=40)
     with p2:
         st.download_button("보고서 저장 (HTML)", report_html.encode("utf-8"),
                            file_name=f"빌라시세_{dong}_{date.today():%Y%m%d}.html",
