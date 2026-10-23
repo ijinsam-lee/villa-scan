@@ -387,6 +387,16 @@ def plan_route(start: dict, stops: list[dict], back: bool) -> list[dict]:
     return [stops[i] for i in best]
 
 
+def kakao_map_link(name: str, lat: float, lon: float) -> str:
+    from urllib.parse import quote
+    name = "".join(ch for ch in str(name) if ch not in ",/")
+    return f"https://map.kakao.com/link/map/{quote(name)},{lat:.6f},{lon:.6f}"
+
+
+def kakao_roadview_link(lat: float, lon: float) -> str:
+    return f"https://map.kakao.com/link/roadview/{lat:.6f},{lon:.6f}"
+
+
 def kakao_route_link(a: dict, b: dict) -> str:
     from urllib.parse import quote
     def pt(p):
@@ -706,10 +716,18 @@ with tab2:
         ed_df = show.rename(columns={"name": "건물명", "ho": "동·호", "jibun": "지번",
                                      "build_year": "건축년도", "floor": "층"})
         ed_df.insert(0, "임장", init)
+        pos = list(ed_df.columns).index("동·호") + 1
+        ed_df.insert(pos, "지도", [kakao_map_link(n, a, o) for n, a, o in
+                                   zip(comps["name"], comps["lat"], comps["lon"])])
+        ed_df.insert(pos + 1, "로드뷰", [kakao_roadview_link(a, o) for a, o in zip(comps["lat"], comps["lon"])])
         edited = st.data_editor(
             ed_df, key=ed_key, hide_index=True, use_container_width=True,
             disabled=[c for c in ed_df.columns if c != "임장"],
-            column_config={"임장": st.column_config.CheckboxColumn("임장", width="small")})
+            column_config={
+                "임장": st.column_config.CheckboxColumn("임장", width="small"),
+                "지도": st.column_config.LinkColumn("지도", display_text="카카오맵", width="small"),
+                "로드뷰": st.column_config.LinkColumn("로드뷰", display_text="보기", width="small"),
+            })
         sel_rows = [i for i, v in enumerate(edited["임장"].tolist()) if v]
         st.session_state.sel_cur = {ids[i] for i in sel_rows}
         sel_qs = list(dict.fromkeys(comps.loc[sel_rows, "q"]))  # 같은 건물 여러 거래는 한 곳으로
@@ -819,6 +837,8 @@ with tab2:
             map_style=LIGHT_MAP,  # 컴퓨터가 다크 모드여도 항상 밝은 지도
         )
         with map_slot:
+            st.markdown(f"경매 물건: [카카오맵에서 보기]({kakao_map_link('경매 물건', lat0, lon0)}) · "
+                        f"[로드뷰]({kakao_roadview_link(lat0, lon0)})")
             move = st.toggle("지도 움직이기 (확대·이동)", key="w_mv",
                              help="끄면 지도 위에서 손가락으로 화면을 스크롤할 수 있습니다.")
             deck.views = [pdk.View(type="MapView", controller=True if move else False)]
