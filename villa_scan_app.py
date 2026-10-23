@@ -152,8 +152,14 @@ def kakao_lookup(kakao_key: str, query: str, strict: bool = False):
     if not docs:
         return None
     d = docs[0]
-    b_code = (d.get("address") or {}).get("b_code", "")
-    return [float(d["y"]), float(d["x"]), b_code]
+    ad = d.get("address") or {}
+    b_code = ad.get("b_code", "")
+    jb = ad.get("main_address_no", "")
+    if ad.get("sub_address_no") not in (None, "", "0"):
+        jb += f"-{ad['sub_address_no']}"
+    if ad.get("mountain_yn") == "Y":
+        jb = "산" + jb
+    return [float(d["y"]), float(d["x"]), b_code, jb]
 
 
 def geocode_many(kakao_key: str, queries: list[str]) -> dict:
@@ -252,16 +258,16 @@ def expos_store() -> dict:
     return {}
 
 
-def fetch_units(service_key: str, b_code: str, jibun: str):
-    """지번 → [(동, 호, 층, 전용면적)] 목록. 실패하면 오류 문자열"""
+def bld_items(service_key: str, op: str, b_code: str, jibun: str):
+    """건축물대장 API 공통 호출 → item(dict) 목록, 실패하면 오류 문자열"""
     jb = jibun.replace("산", "").strip()
     bun, _, ji = jb.partition("-")
     if not bun.isdigit() or (ji and not ji.isdigit()) or len(b_code) != 10:
         return []
-    units, page = {}, 1
-    while True:
+    out, page = [], 1
+    while page <= 10:
         try:
-            r = requests.get(BLD_URL, params={
+            r = requests.get(f"https://apis.data.go.kr/1613000/BldRgstHubService/{op}", params={
                 "serviceKey": service_key, "sigunguCd": b_code[:5], "bjdongCd": b_code[5:],
                 "platGbCd": "1" if jibun.strip().startswith("산") else "0",
                 "bun": bun.zfill(4), "ji": (ji or "0").zfill(4),
@@ -273,24 +279,41 @@ def fetch_units(service_key: str, b_code: str, jibun: str):
         code = root.findtext(".//resultCode")
         if err or (code not in (None, "00", "000")):
             return err or f"{code} {root.findtext('.//resultMsg')}"
-        items = list(root.iter("item"))
-        for it in items:
-            g = {c.tag: (c.text or "").strip() for c in it}
-            if g.get("exposPubuseGbCd") not in ("1", "") and "전유" not in g.get("exposPubuseGbCdNm", ""):
-                continue
-            try:
-                flr = int(float(g.get("flrNo") or 0))
-                area = float(g.get("area") or 0)
-            except ValueError:
-                continue
-            if "지하" in g.get("flrGbCdNm", ""):
-                flr = -flr
-            key = (g.get("dongNm", ""), g.get("hoNm", ""), flr)
-            units[key] = units.get(key, 0.0) + area      # 한 호실의 전유면적 합산
+        items = [{c.tag: (c.text or "").strip() for c in it} for it in root.iter("item")]
+        out += items
         if len(items) < 500:
             break
         page += 1
-    return [(d, h, f, a) for (d, h, f), a in units.items()]
+    return out
+
+
+def fetch_units(service_key: str, b_code: str, jibun: str):
+    """지번 → [(동, 호, 층, 전용면적, 용도)] 목록. 실패하면 오류 문자열"""
+    items = bld_items(service_key, "getBrExposPubuseAreaInfo", b_code, jibun)
+    if isinstance(items, str):
+        return items
+    units, purpose = {}, {}
+    for g in items:
+        if g.get("exposPubuseGbCd") not in ("1", "") and "전유" not in g.get("exposPubuseGbCdNm", ""):
+            continue
+        try:
+            flr = int(float(g.get("flrNo") or 0))
+            area = float(g.get("area") or 0)
+        except ValueError:
+            continue
+        if "지하" in g.get("flrGbCdNm", ""):
+            flr = -flr
+        key = (g.get("dongNm", ""), g.get("hoNm", ""), flr)
+        units[key] = units.get(key, 0.0) + area      # 한 호실의 전유면적 합산
+        main_p, etc_p = g.get("mainPurpsCdNm", ""), g.get("etcPurps", "")
+        purpose.setdefault(key, f"{main_p}({etc_p})" if main_p and etc_p and etc_p != main_p
+                           else main_p or etc_p)
+    return [(d, h, f, a, purpose[(d, h, f)]) for (d, h, f), a in units.items()]
+
+
+def ho_name(d: str, h: str) -> str:
+    h = h if h.endswith("호") else f"{h}호"
+    return f"{d} {h}".strip() if d and d not in ("주동", "0") else h
 
 
 def guess_ho(units, floor, area_m2) -> str:
@@ -298,15 +321,12 @@ def guess_ho(units, floor, area_m2) -> str:
     if not isinstance(units, list) or not units or pd.isna(floor):
         return ""
     for tol in (0.05, 0.5):
-        hits = [(d, h) for d, h, f, a in units if f == int(floor) and abs(a - area_m2) <= tol]
+        hits = [(u[0], u[1]) for u in units if u[2] == int(floor) and abs(u[3] - area_m2) <= tol]
         if hits:
             break
     if not hits:
         return ""
-    def fmt(d, h):
-        h = h if h.endswith("호") else f"{h}호"
-        return f"{d} {h}".strip() if d and d not in ("주동", "0") else h
-    names = sorted({fmt(d, h) for d, h in hits})
+    names = sorted({ho_name(d, h) for d, h in hits})
     return names[0] if len(names) == 1 else " / ".join(names[:3]) + (" 등" if len(names) > 3 else "") + "?"
 
 
@@ -427,6 +447,7 @@ for k, v in {
     "w_year": qnum("year", 1990, 1960, date.today().year),
     "w_floor": qnum("floor", 2, -2, 30),
     "w_bid": qnum("bid", 6664, 0, 200000),
+    "w_ho": qp.get("ho", ""),
     "w_m": qnum("m", 12, 6, 24),
     "w_r": _r if _r in (300, 500, 700, 1000) else 300,
     "w_at": qnum("at", 3, 1, 6),
@@ -473,6 +494,8 @@ with st.sidebar:
     c3, c4 = st.columns(2)
     floor = c3.number_input("층", -2, 30, key="w_floor")
     min_bid = c4.number_input("최저가 (만원)", 0, 200000, step=10, key="w_bid")
+    ho_in = st.text_input("호수 (선택)", key="w_ho", placeholder="예: 301",
+                          help="넣으면 건물 정보 탭에서 그 호실의 서류상 용도와 면적을 확인합니다.")
 
     st.subheader("조회 조건")
     months = st.slider("기간 (개월)", 6, 24, key="w_m")
@@ -507,7 +530,8 @@ if run or auto:
     if not target or not target[2]:
         st.error(f"'{addr}' 주소를 찾지 못했습니다. 호수·건물명은 빼고 '시/도 시군구 동 번지'까지만 입력하세요.")
         st.stop()
-    lat0, lon0, b_code = target
+    lat0, lon0, b_code = target[:3]
+    t_jibun = target[3] if len(target) > 3 else ""
     lawd_cd = b_code[:5]
 
     with st.spinner(f"최근 {months}개월 실거래를 불러오는 중"):
@@ -530,7 +554,7 @@ if run or auto:
     if run:  # 새로 조회하면 동네 선택은 새 주소 기준으로
         st.session_state.pop("w_dong", None)
         st.query_params.pop("dong", None)
-    st.session_state.update(trades=trades, lat0=lat0, lon0=lon0, addr=addr,
+    st.session_state.update(trades=trades, lat0=lat0, lon0=lon0, addr=addr, b_code=b_code, t_jibun=t_jibun,
                             sgg=" ".join(addr.split()[:-2]))
 
 if "trades" not in st.session_state:
@@ -577,9 +601,9 @@ components.html("""<script>
       t.addEventListener('click', () => localStorage.setItem(KEY, t.innerText.trim())); } }); }, 1000);
 })();
 </script>""", height=0)
-report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None}
+report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None}
 
-tab1, tab2, tab3 = st.tabs(["동네 프로필", "비교사례", "예상 매도가"])
+tab1, tab2, tab3, tab4 = st.tabs(["동네 프로필", "비교사례", "예상 매도가", "건물 정보"])
 
 # ── 동네 프로필
 with tab1:
@@ -844,6 +868,113 @@ with tab3:
         st.caption("희망 차익은 매도가 − 낙찰가 기준입니다. 강의 기준으로 세후 1천만 원은 차익 약 2,500만 원이 필요합니다.")
 
 
+
+# ── 건물 정보 (건축물대장)
+def ymd(v: str) -> str:
+    return f"{v[:4]}.{v[4:6]}.{v[6:8]}" if v and len(v) == 8 and v.isdigit() else "-"
+
+
+def to_num(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+with tab4:
+    with st.expander("빌라 경매에서 건물 정보를 보는 법"):
+        st.markdown(
+            "- **근생빌라 여부**: 건축물대장 전유부에 호실별 용도가 나옵니다. 서류상 '제2종근린생활시설'인데 "
+            "주거로 쓰는 호실이면 대출이 잘 안 나오고 이행강제금 위험이 있습니다.\n"
+            "- **건물 기본 정보(표제부)**: 사용승인일, 구조(철근콘크리트·벽돌 등), 세대수, 층수, 엘리베이터 수, "
+            "주차대수, 대지면적과 용적률이 나옵니다. \"주차 자리가 있나\", \"엘리베이터가 있나\"처럼 "
+            "누구에게 팔지 판단할 때 필요한 정보입니다.\n"
+            "- **위반건축물 여부**: 건축물대장 API의 표제부에는 위반 여부 항목이 없습니다. 정부24에서 "
+            "건축물대장을 떼어 첫 장 오른쪽 위의 '위반건축물' 표시를 확인하는 게 확실하고, "
+            "매각물건명세서 비고란도 함께 보세요."
+        )
+    ss = st.session_state
+    bc, tj = ss.get("b_code", ""), ss.get("t_jibun", "")
+    store = expos_store()
+    if not tj:
+        st.info("이 주소의 지번을 확인하지 못해 건축물대장을 조회할 수 없습니다. 지번 주소로 다시 조회해 보세요.")
+    else:
+        for k, op in [(("title", bc, tj), "title"), ((bc, tj), "units")]:
+            if k not in store:
+                store[k] = (bld_items(data_key, "getBrTitleInfo", bc, tj) if op == "title"
+                            else fetch_units(data_key, bc, tj))
+        titles, units = store[("title", bc, tj)], store[(bc, tj)]
+        for k in [("title", bc, tj), (bc, tj)]:
+            if isinstance(store[k], str):
+                st.warning(f"건축물대장 조회 실패: {store[k]}")
+                store.pop(k)
+        bld = {"rows": [], "checks": []}
+
+        if isinstance(titles, list) and titles:
+            mains = [t for t in titles if t.get("mainAtchGbCd", "0") == "0"] or titles
+            if len(mains) > 1:
+                st.caption(f"이 지번에 주건축물이 {len(mains)}동 있습니다.")
+            for t in mains[:3]:
+                appr = t.get("useAprDay", "")
+                yrs = date.today().year - int(appr[:4]) if appr[:4].isdigit() else None
+                hh = int(max(to_num(t.get("hhldCnt")), to_num(t.get("hoCnt")), to_num(t.get("fmlyCnt"))))
+                park = int(sum(to_num(t.get(k)) for k in
+                               ["indrMechUtcnt", "oudrMechUtcnt", "indrAutoUtcnt", "oudrAutoUtcnt"]))
+                elev = int(to_num(t.get("rideUseElvtCnt")) + to_num(t.get("emgenUseElvtCnt")))
+                grnd, ugrnd = int(to_num(t.get("grndFlrCnt"))), int(to_num(t.get("ugrndFlrCnt")))
+                dn = t.get("dongNm", "").strip()
+                st.markdown(f"**{t.get('newPlatPlc') or t.get('platPlc', '')}** {dn}")
+                rows = [
+                    ("사용승인", f"{ymd(appr)}" + (f" ({yrs}년차)" if yrs is not None else "")),
+                    ("구조", t.get("strctCdNm") or "-"),
+                    ("용도", t.get("etcPurps") or t.get("mainPurpsCdNm") or "-"),
+                    ("층수", f"지상 {grnd}층" + (f" · 지하 {ugrnd}층" if ugrnd else "")),
+                    ("세대수", f"{hh}세대" if hh else "-"),
+                    ("엘리베이터", f"{elev}대" if elev else "없음"),
+                    ("주차", f"{park}대" + (f" (세대당 {park / hh:.1f}대)" if hh else "")),
+                    ("대지면적", f"{to_num(t.get('platArea')):,.1f}㎡"),
+                    ("건폐율·용적률", f"{to_num(t.get('bcRat')):.1f}% · {to_num(t.get('vlRat')):.1f}%"),
+                    ("내진설계", "적용" if t.get("rserthqkDsgnApplyYn") == "1" else "미적용·정보 없음"),
+                ]
+                st.table(pd.DataFrame(rows, columns=["항목", "내용"]).set_index("항목"))
+                bld["rows"] += rows
+                if not elev and grnd >= 4:
+                    bld["checks"].append(("warn", f"엘리베이터 없는 지상 {grnd}층 건물입니다. 고층 호실은 노인·어린 자녀 가구가 꺼려 매수층이 좁습니다."))
+                if hh and park / hh < 0.5:
+                    bld["checks"].append(("warn", f"세대당 주차 {park / hh:.1f}대로 부족한 편입니다. 차가 있는 3~4인 가구에는 팔기 어려울 수 있습니다."))
+                if "근린생활" in (t.get("mainPurpsCdNm", "") + t.get("etcPurps", "")):
+                    bld["checks"].append(("err", "건물 주용도에 근린생활시설이 포함되어 있습니다. 호실별 용도를 꼭 확인하세요."))
+        elif isinstance(titles, list):
+            st.info("건축물대장 표제부를 찾지 못했습니다.")
+
+        if isinstance(units, list) and units:
+            geun = [u for u in units if "근린생활" in u[4]]
+            if geun:
+                names = ", ".join(sorted(ho_name(u[0], u[1]) for u in geun)[:8])
+                bld["checks"].append(("err", f"근생 호실 {len(geun)}개: {names}. 서류상 상가인데 주거로 쓰면 "
+                                             "대출이 어렵고 이행강제금 대상이 될 수 있습니다."))
+            else:
+                bld["checks"].append(("ok", f"전유부 {len(units)}개 호실 모두 주거용 용도입니다(근생 호실 없음)."))
+            ho = ss.get("w_ho", "").strip().replace("호", "")
+            if ho:
+                mine = [u for u in units if u[1].replace("호", "").lstrip("0") == ho.lstrip("0")]
+                if mine:
+                    d, h, f, a, p = mine[0]
+                    diff = a - area_m2
+                    msg = (f"{ho_name(d, h)}: {f}층 · 전용 {a:.2f}㎡ · 서류상 용도 '{p or '-'}'")
+                    if abs(diff) > 0.1:
+                        msg += f" (입력한 전용면적 {area_m2:.2f}㎡과 {diff:+.2f}㎡ 차이)"
+                    bld["checks"].append(("err" if "근린생활" in p else "ok", msg))
+                else:
+                    bld["checks"].append(("warn", f"{ho}호를 건축물대장 전유부에서 찾지 못했습니다. 호수 표기를 확인하세요."))
+
+        bld["checks"].append(("info", "위반건축물 여부는 이 API에 나오지 않습니다. 정부24나 세움터에서 건축물대장을 열람해 "
+                                      "첫 장 오른쪽 위 '위반건축물' 표시를 확인하고, 매각물건명세서의 비고란도 함께 보세요."))
+        for kind, msg in bld["checks"]:
+            {"ok": st.success, "warn": st.warning, "err": st.error, "info": st.info}[kind](msg)
+        report["bld"] = bld
+
+
 # ───────────────────────── 인쇄용 보고서 ─────────────────────────
 
 def build_report_html() -> str:
@@ -874,6 +1005,16 @@ def build_report_html() -> str:
         parts.append(f"<tr><td>{e(name)}</td><td>{e(label)}</td><td class='num'>{share:.0f}%</td>"
                      f"<td class='num'>{rank}위</td><td>{e(top)}</td></tr>")
     parts.append(f"</table><div class='box'>{e(report['verdict'])}</div>")
+
+    bl = report.get("bld")
+    if bl and (bl["rows"] or bl["checks"]):
+        parts.append("<h2>건물 정보 (건축물대장)</h2><table>")
+        for i in range(0, len(bl["rows"]), 2):
+            pair = bl["rows"][i:i + 2]
+            parts.append("<tr>" + "".join(f"<th>{e(k)}</th><td>{e(v)}</td>" for k, v in pair) + "</tr>")
+        parts.append("</table>")
+        for kind, msg in bl["checks"]:
+            parts.append(f"<div class='box{' warn' if kind in ('warn', 'err') else ''}'>{e(msg)}</div>")
 
     r = report.get("est")
     if r:
@@ -955,7 +1096,7 @@ document.getElementById('pbtn').onclick = () => {{
 ss = st.session_state
 st.query_params.update({
     "addr": ss.addr, "area": f"{area_m2:g}", "year": str(build_year), "floor": str(floor),
-    "bid": str(min_bid), "m": str(months), "r": str(radius), "at": str(area_tol), "yt": str(age_tol),
+    "bid": str(min_bid), "ho": ss.get("w_ho", ""), "m": str(months), "r": str(radius), "at": str(area_tol), "yt": str(age_tol),
     "dong": dong, "sel": ",".join(sorted(ss.get("sel_cur", set()))),
     "it": "1" if ss.get("w_it", True) else "0", "bk": "1" if ss.get("w_bk", True) else "0",
     "stn": str(ss.get("w_stn", 0)), "mv": "1" if ss.get("w_mv") else "0",
