@@ -239,6 +239,67 @@ def won(manwon: float) -> str:
     return f"{eok}억" if eok else f"{man:,}만"
 
 
+# ───────────────────────── 임장 동선 ─────────────────────────
+
+WALK_FACTOR = 1.3      # 직선거리 → 실제 걸음거리 보정
+WALK_M_PER_MIN = 67    # 시속 4km
+STAY_MIN = 10          # 건물당 확인 시간(분)
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def nearest_stations(kakao_key: str, lat: float, lon: float, radius: int = 2000) -> list[dict]:
+    """카카오 장소 검색(지하철역 SW8)으로 가까운 역 목록"""
+    try:
+        r = requests.get("https://dapi.kakao.com/v2/local/search/category.json",
+                         params={"category_group_code": "SW8", "x": lon, "y": lat,
+                                 "radius": radius, "sort": "distance", "size": 5},
+                         headers={"Authorization": f"KakaoAK {kakao_key.strip()}"}, timeout=10)
+        docs = r.json().get("documents", [])
+    except Exception:
+        return []
+    return [dict(name=d["place_name"], lat=float(d["y"]), lon=float(d["x"]),
+                 dist=int(d.get("distance") or 0)) for d in docs]
+
+
+def walk_m(a: dict, b: dict) -> float:
+    return haversine_m(a["lat"], a["lon"], b["lat"], b["lon"]) * WALK_FACTOR
+
+
+def plan_route(start: dict, stops: list[dict], back: bool) -> list[dict]:
+    """출발역에서 모든 건물을 가장 짧게 도는 순서 (8곳 이하는 전수 탐색)"""
+    from itertools import permutations
+
+    def total(order):
+        pts = [start] + [stops[i] for i in order] + ([start] if back else [])
+        return sum(walk_m(p, q) for p, q in zip(pts, pts[1:]))
+
+    idx = list(range(len(stops)))
+    if len(stops) <= 8:
+        best = min(permutations(idx), key=total)
+    else:  # 가까운 곳부터 → 2-opt 개선
+        best, cur, left = [], start, set(idx)
+        while left:
+            nxt = min(left, key=lambda i: walk_m(cur, stops[i]))
+            best.append(nxt); left.remove(nxt); cur = stops[nxt]
+        improved = True
+        while improved:
+            improved = False
+            for i in range(len(best) - 1):
+                for j in range(i + 1, len(best)):
+                    cand = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                    if total(cand) < total(best) - 1:
+                        best, improved = cand, True
+    return [stops[i] for i in best]
+
+
+def kakao_route_link(a: dict, b: dict) -> str:
+    from urllib.parse import quote
+    def pt(p):
+        name = "".join(ch for ch in p["name"] if ch not in ",/")
+        return f"{quote(name)},{p['lat']:.6f},{p['lon']:.6f}"
+    return f"https://map.kakao.com/link/from/{pt(a)}/to/{pt(b)}"
+
+
 # ───────────────────────── 차트 ─────────────────────────
 
 def bin_chart(dist: pd.Series, highlight=None, height=200):
@@ -350,7 +411,7 @@ guess = next((d for d in dongs if d in st.session_state.addr), dongs[0])
 dong = st.selectbox("동네", dongs, index=dongs.index(guess))
 dong_df = trades[trades["dong"] == dong]
 print_slot = st.container()
-report = {"fit": [], "verdict": "", "comps": None, "est": None}
+report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None}
 
 tab1, tab2, tab3 = st.tabs(["동네 프로필", "비교사례", "예상 매도가"])
 
@@ -418,15 +479,15 @@ with tab2:
             평단가=comps["ppy"].round().astype(int),
         )[["거래일", "name", "jibun", "거리", "전용평", "build_year", "floor", "금액", "평단가"]]
         report["comps"] = show
-        st.caption("표에서 행을 선택하면 지도에 노란색으로 표시됩니다.")
+        st.caption("임장할 거래를 표 왼쪽 칸에서 여러 개 선택하면, 아래에 지하철역 기준 방문 순서가 나옵니다.")
         event = st.dataframe(
             show.rename(columns={"name": "건물명", "jibun": "지번", "build_year": "건축년도", "floor": "층"}),
             hide_index=True, use_container_width=True,
-            on_select="rerun", selection_mode="single-row", key="comp_table")
-        sel_rows = event.selection.rows if event else []
-        sel_q = comps.loc[sel_rows[0], "q"] if sel_rows else None
+            on_select="rerun", selection_mode="multi-row", key="comp_table")
+        sel_rows = list(event.selection.rows) if event else []
+        sel_qs = list(dict.fromkeys(comps.loc[sel_rows, "q"]))  # 같은 건물 여러 거래는 한 곳으로
 
-        # 같은 지번의 여러 거래를 한 점으로 묶고, 마우스를 올리면 내역이 보이게 함
+        # 같은 지번의 여러 거래를 한 점으로 묶고, 점을 누르면 내역이 보이게 함
         def summarize(g):
             g = g.sort_values("deal_date", ascending=False)
             name, jibun = str(g["name"].iloc[0]), str(g["jibun"].iloc[0])
@@ -435,7 +496,7 @@ with tab2:
                 f"{d:%y.%m.%d} · {f:.0f}층 · {won(p)} (평당 {pp:,.0f}만)"
                 for d, f, p, pp in zip(g["deal_date"], g["floor"], g["price"], g["ppy"]))
             return pd.Series({
-                "lat": g["lat"].iloc[0], "lon": g["lon"].iloc[0],
+                "lat": g["lat"].iloc[0], "lon": g["lon"].iloc[0], "title": title,
                 "label": f"{title} · {g['dist_m'].iloc[0]:.0f}m\n"
                          f"{g['build_year'].iloc[0]:.0f}년식 · 전용 {g['area_py'].iloc[0]:.1f}평\n"
                          f"{lines}",
@@ -443,30 +504,87 @@ with tab2:
             })
         grouped = pd.DataFrame([summarize(g).rename(None) for _, g in comps.groupby("q")])
         grouped["q"] = [q for q, _ in comps.groupby("q")]
-        grouped["color"] = [[250, 176, 5, 230] if q == sel_q else [28, 126, 214, 200] for q in grouped["q"]]
-        grouped["radius"] = [float(18 if q == sel_q else 8 + 3 * min(n, 4))
-                             for q, n in zip(grouped["q"], grouped["n"])]
         grouped["lat"] = grouped["lat"].astype(float)
         grouped["lon"] = grouped["lon"].astype(float)
+        grouped["color"] = [[250, 176, 5, 235] if q in sel_qs else [28, 126, 214, 200] for q in grouped["q"]]
+        grouped["radius"] = [float(14 if q in sel_qs else 8 + 3 * min(n, 4))
+                             for q, n in zip(grouped["q"], grouped["n"])]
         target_df = pd.DataFrame({"lat": [lat0], "lon": [lon0],
                                   "label": [f"경매 물건\n{st.session_state.addr}"]})
 
+        # ── 임장 동선
+        route, station = [], None
+        if sel_qs:
+            st.markdown("#### 임장 동선")
+            r1, r2 = st.columns(2)
+            include_target = r1.checkbox("경매 물건도 들르기", value=True)
+            back = r2.checkbox("마지막에 역으로 돌아오기", value=True)
+            stops = [dict(name=row.title, lat=row.lat, lon=row.lon)
+                     for row in grouped.set_index("q").loc[sel_qs].itertuples()]
+            if include_target:
+                stops.append(dict(name="경매 물건", lat=lat0, lon=lon0))
+            clat = sum(p["lat"] for p in stops) / len(stops)
+            clon = sum(p["lon"] for p in stops) / len(stops)
+            stations = nearest_stations(kakao_key, round(clat, 4), round(clon, 4))
+            if not stations:
+                st.warning("2km 안에 지하철역이 없어 경매 물건에서 출발하는 순서로 짰습니다.")
+                station = dict(name="경매 물건", lat=lat0, lon=lon0)
+                stops = [p for p in stops if p["name"] != "경매 물건"] or stops
+            else:
+                pick = st.selectbox("출발역", range(len(stations)),
+                                    format_func=lambda i: f"{stations[i]['name']} (중심에서 {stations[i]['dist']:,}m)")
+                station = stations[pick]
+            route = plan_route(station, stops, back)
+
+            pts = [station] + route + ([station] if back else [])
+            legs = [walk_m(a, b) for a, b in zip(pts, pts[1:])]
+            total_m = sum(legs)
+            total_min = total_m / WALK_M_PER_MIN + STAY_MIN * len(route)
+            st.write(f"걷는 거리 약 **{total_m / 1000:.1f}km** · 이동 {total_m / WALK_M_PER_MIN:.0f}분 + "
+                     f"확인 {STAY_MIN}분×{len(route)}곳 = 총 **{int(total_min // 60)}시간 {total_min % 60:.0f}분** 예상")
+            lines = [f"🚇 **출발** {station['name']}"]
+            for i, (a, b, m) in enumerate(zip(pts, pts[1:], legs), start=1):
+                to = f"**{i}. {b['name']}**" if i <= len(route) else f"🚇 **도착** {b['name']}"
+                lines.append(f"{to} — 도보 약 {m / WALK_M_PER_MIN:.0f}분 ({m:,.0f}m) · "
+                             f"[길찾기]({kakao_route_link(a, b)})")
+            st.markdown("  \n".join(lines))
+            st.caption("거리는 직선거리에 1.3배를 곱한 추정치입니다. 길찾기를 누르면 카카오맵에서 실제 경로가 열립니다.")
+            report["route"] = dict(station=station["name"], back=back, total_m=total_m, total_min=total_min,
+                                   rows=[(i, b["name"], m) for i, (b, m) in enumerate(zip(pts[1:], legs), start=1)])
+
         import pydeck as pdk
+        layers = [
+            pdk.Layer("ScatterplotLayer", grouped, get_position="[lon, lat]",
+                      get_fill_color="color", get_radius="radius",
+                      radius_min_pixels=5, radius_max_pixels=20, pickable=True),
+            # 경매 물건은 속이 빈 빨간 원 → 같은 자리의 거래 점이 가려지지 않음
+            pdk.Layer("ScatterplotLayer", target_df, get_position="[lon, lat]",
+                      filled=False, stroked=True, get_line_color=[224, 49, 49],
+                      line_width_min_pixels=4, get_radius=25,
+                      radius_min_pixels=12, radius_max_pixels=26, pickable=True),
+        ]
+        view_lat, view_lon, zoom = lat0, lon0, 16
+        if route:
+            path_pts = [station] + route + ([station] if back else [])
+            layers.insert(0, pdk.Layer(
+                "PathLayer", pd.DataFrame({"path": [[[p["lon"], p["lat"]] for p in path_pts]]}),
+                get_path="path", get_color=[47, 158, 68, 200], width_min_pixels=4))
+            nums = pd.DataFrame([dict(lat=p["lat"], lon=p["lon"], t=str(i)) for i, p in enumerate(route, 1)])
+            layers.append(pdk.Layer("TextLayer", nums, get_position="[lon, lat]", get_text="t",
+                                    get_size=18, get_color=[20, 20, 20], get_pixel_offset=[0, -22],
+                                    font_weight=700, background=True, get_background_color=[255, 255, 255, 230]))
+            st_df = pd.DataFrame([dict(lat=station["lat"], lon=station["lon"], label=f"출발역\n{station['name']}")])
+            layers.append(pdk.Layer("ScatterplotLayer", st_df, get_position="[lon, lat]",
+                                    get_fill_color=[47, 158, 68], get_radius=20,
+                                    radius_min_pixels=9, radius_max_pixels=14, pickable=True))
+            lats = [p["lat"] for p in path_pts]; lons = [p["lon"] for p in path_pts]
+            view_lat, view_lon = (max(lats) + min(lats)) / 2, (max(lons) + min(lons)) / 2
+            span = max(max(lats) - min(lats), (max(lons) - min(lons)) * 0.8)
+            zoom = 16 if span < 0.004 else 15 if span < 0.009 else 14 if span < 0.018 else 13
+
         deck = pdk.Deck(
-            layers=[
-                pdk.Layer("ScatterplotLayer", grouped, get_position="[lon, lat]",
-                          get_fill_color="color", get_radius="radius",
-                          radius_min_pixels=5, radius_max_pixels=20, pickable=True),
-                # 경매 물건은 속이 빈 빨간 원 → 같은 자리의 거래 점이 가려지지 않음
-                pdk.Layer("ScatterplotLayer", target_df, get_position="[lon, lat]",
-                          filled=False, stroked=True, get_line_color=[224, 49, 49],
-                          line_width_min_pixels=4, get_radius=25,
-                          radius_min_pixels=12, radius_max_pixels=26, pickable=True),
-            ],
-            initial_view_state=pdk.ViewState(
-                latitude=lat0 if sel_q is None else grouped.loc[grouped["q"] == sel_q, "lat"].iloc[0],
-                longitude=lon0 if sel_q is None else grouped.loc[grouped["q"] == sel_q, "lon"].iloc[0],
-                zoom=16),
+            layers=layers,
+            initial_view_state=pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=zoom),
             tooltip={"text": "{label}"},
             map_style=LIGHT_MAP,  # 컴퓨터가 다크 모드여도 항상 밝은 지도
         )
@@ -478,8 +596,8 @@ with tab2:
                 st.pydeck_chart(deck, use_container_width=True, height=380 if move else 300)
             except TypeError:  # 구버전 streamlit
                 st.pydeck_chart(deck, use_container_width=True)
-            st.caption("빨간 테두리가 경매 물건, 파란 점이 최근 거래입니다. 점에 마우스를 올리면 건물명과 거래 내역이 보이고, "
-                       "점이 클수록 같은 건물에서 거래가 많았다는 뜻입니다.")
+            st.caption("빨간 테두리: 경매 물건 · 파란 점: 최근 거래(클수록 거래 많음) · 노란 점: 선택한 임장지 · "
+                       "초록: 출발역과 동선. 점을 누르면 건물명과 거래 내역이 보입니다.")
 
 # ── 예상 매도가
 with tab3:
@@ -561,6 +679,17 @@ def build_report_html() -> str:
         if est["spread"] >= 2.0 or est["n_out"] > 0:
             parts.append(f"<div class='box warn'>평단가 편차 {est['spread']:.1f}배, 이상치 {est['n_out']}건 제외 "
                          f"(업계약 가능성 확인 필요)</div>")
+
+    rt = report.get("route")
+    if rt:
+        parts.append(f"<h2>임장 동선 · {e(rt['station'])} 출발</h2><table><tr><th>순서</th><th>방문지</th>"
+                     f"<th>도보</th><th>확인</th></tr>")
+        for i, name, m in rt["rows"]:
+            last = rt["back"] and i == len(rt["rows"])
+            parts.append(f"<tr><td class='num'>{'도착' if last else i}</td><td>{e(name)}</td>"
+                         f"<td class='num'>약 {m / WALK_M_PER_MIN:.0f}분 ({m:,.0f}m)</td><td>☐</td></tr>")
+        parts.append(f"</table><div class='box'>걷는 거리 약 {rt['total_m'] / 1000:.1f}km · "
+                     f"확인 시간 포함 약 {int(rt['total_min'] // 60)}시간 {rt['total_min'] % 60:.0f}분</div>")
 
     show = report.get("comps")
     if show is not None and len(show):
