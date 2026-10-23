@@ -313,7 +313,11 @@ def fetch_units(service_key: str, b_code: str, jibun: str):
 
 def ho_name(d: str, h: str) -> str:
     h = h if h.endswith("호") else f"{h}호"
-    return f"{d} {h}".strip() if d and d not in ("주동", "0") else h
+    d = (d or "").strip()
+    # 동 이름 칸에 '3층'처럼 층이 잘못 적힌 건물이 있어 걸러냄
+    if not d or d in ("주동", "0") or d.endswith("층"):
+        return h
+    return f"{d} {h}"
 
 
 def guess_ho(units, floor, area_m2) -> str:
@@ -754,8 +758,9 @@ with tab2:
                 station = dict(name="경매 물건", lat=lat0, lon=lon0)
                 stops = [p for p in stops if p["name"] != "경매 물건"] or stops
             else:
-                if st.session_state.get("w_stn", 0) >= len(stations):
-                    st.session_state["w_stn"] = 0
+                cur = st.session_state.get("w_stn")
+                if not isinstance(cur, int) or not 0 <= cur < len(stations):
+                    st.session_state["w_stn"] = 0  # 저장된 값이 비었거나 역 목록이 바뀐 경우
                 pick = st.selectbox("출발역", range(len(stations)), key="w_stn",
                                     format_func=lambda i: f"{stations[i]['name']} (중심에서 {stations[i]['dist']:,}m)")
                 station = stations[pick]
