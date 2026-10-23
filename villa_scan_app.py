@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -238,6 +239,22 @@ def won(manwon: float) -> str:
     return f"{eok}억" if eok else f"{man:,}만"
 
 
+# ───────────────────────── 차트 ─────────────────────────
+
+def bin_chart(dist: pd.Series, highlight=None, height=200):
+    """구간 순서를 지키고, 이 물건의 구간은 빨간색으로 표시.
+    확대/이동 기능을 빼서 휴대폰에서 손가락으로 스크롤해도 그래프가 움직이지 않음"""
+    df = pd.DataFrame({"구간": [str(i) for i in dist.index], "거래": dist.values})
+    hl = str(highlight) if highlight is not None else ""
+    return (alt.Chart(df).mark_bar().encode(
+        x=alt.X("구간:N", sort=list(df["구간"]), title=None,
+                axis=alt.Axis(labelAngle=-35, labelFontSize=11)),
+        y=alt.Y("거래:Q", title=None),
+        color=alt.condition(alt.datum["구간"] == hl, alt.value("#E03131"), alt.value("#1C7ED6")),
+        tooltip=["구간", "거래"],
+    ).properties(height=height))
+
+
 # ───────────────────────── 화면 ─────────────────────────
 
 def secret(name: str) -> str:
@@ -354,12 +371,12 @@ with tab1:
         hits += rank in (1, 2)
         with col:
             st.markdown(f"**{name}**")
-            st.bar_chart(dist, height=220)
+            st.altair_chart(bin_chart(dist, targets[name]), use_container_width=True)
             if targets[name] is not None:
                 st.caption(f"이 물건: {targets[name]} · 거래 비중 {share:.0f}% · {rank}위")
                 report["fit"].append((name, str(targets[name]), share, rank,
                                       str(dist.idxmax()) if dist.sum() else "-"))
-    st.caption("매매금액은 최저가 기준 구간입니다.")
+    st.caption("빨간 막대가 이 물건이 속한 구간입니다. 매매금액은 최저가 기준입니다.")
     verdict = {4: "네 항목 모두 이 동네에서 잘 팔리는 구간입니다.",
                3: "대부분 잘 팔리는 구간입니다. 벗어난 항목을 임장에서 확인하세요.",
                2: "절반만 맞습니다. 누구에게 팔지 다시 따져 보세요."}
@@ -454,7 +471,13 @@ with tab2:
             map_style=LIGHT_MAP,  # 컴퓨터가 다크 모드여도 항상 밝은 지도
         )
         with map_slot:
-            st.pydeck_chart(deck, use_container_width=True)
+            move = st.toggle("지도 움직이기 (확대·이동)", value=False,
+                             help="끄면 지도 위에서 손가락으로 화면을 스크롤할 수 있습니다.")
+            deck.views = [pdk.View(type="MapView", controller=True if move else False)]
+            try:
+                st.pydeck_chart(deck, use_container_width=True, height=380 if move else 300)
+            except TypeError:  # 구버전 streamlit
+                st.pydeck_chart(deck, use_container_width=True)
             st.caption("빨간 테두리가 경매 물건, 파란 점이 최근 거래입니다. 점에 마우스를 올리면 건물명과 거래 내역이 보이고, "
                        "점이 클수록 같은 건물에서 거래가 많았다는 뜻입니다.")
 
@@ -476,7 +499,12 @@ with tab3:
         a.metric("예상 매도가", won(sell))
         b.metric("평단가 범위 (중간 50%)", f"{est['p25']:,.0f}~{est['p75']:,.0f}만")
         c.metric("비교 거래", f"{est['n']}건")
-        st.bar_chart(comps["ppy"].round(-1).value_counts().sort_index(), height=200)
+        ppy_bins = list(range(int(comps["ppy"].min() // 100 * 100), int(comps["ppy"].max()) + 101, 100))
+        ppy_dist = pd.cut(comps["ppy"], bins=ppy_bins, right=False).value_counts().sort_index()
+        ppy_dist.index = [f"{int(i.left):,}" for i in ppy_dist.index]
+        hl = next((lbl for lbl, iv in zip(ppy_dist.index, ppy_bins) if iv <= ppy < iv + 100), None)
+        st.altair_chart(bin_chart(ppy_dist, hl, height=180), use_container_width=True)
+        st.caption("평단가 분포(만원, 100만 단위). 빨간 막대가 적용 평단가 구간입니다.")
 
         st.markdown("**입찰가 역산**")
         x1, x2, x3 = st.columns(3)
