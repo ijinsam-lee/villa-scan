@@ -1076,10 +1076,10 @@ with print_slot:
     with p1:
         import streamlit.components.v1 as components
         components.html(f"""
-<style>html,body{margin:0;padding:0;background:transparent}
-#pbtn{width:100%;height:40px;border:1px solid rgba(49,51,63,.2);border-radius:8px;background:#fff;color:#31333f;
-  font-size:14px;cursor:pointer;font-family:"Source Sans Pro",sans-serif;box-sizing:border-box}
-#pbtn:hover{border-color:#ff4b4b;color:#ff4b4b}</style>
+<style>html,body{{margin:0;padding:0;background:transparent}}
+#pbtn{{width:100%;height:40px;border:1px solid rgba(49,51,63,.2);border-radius:8px;background:#fff;color:#31333f;
+  font-size:14px;cursor:pointer;font-family:"Source Sans Pro",sans-serif;box-sizing:border-box}}
+#pbtn:hover{{border-color:#ff4b4b;color:#ff4b4b}}</style>
 <button id="pbtn">🖨️ 인쇄</button>
 <script>
 const html = {json.dumps(report_html)};
