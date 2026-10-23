@@ -12,6 +12,7 @@
 실행: pip install streamlit pandas requests  →  streamlit run villa_scan_app.py
 """
 
+import hashlib
 import json
 import math
 import os
@@ -23,6 +24,7 @@ import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 PYEONG = 3.3058
 RT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcRHTrade2/getRTMSDataSvcRHTrade2"
@@ -239,6 +241,75 @@ def won(manwon: float) -> str:
     return f"{eok}억" if eok else f"{man:,}만"
 
 
+# ───────────────────────── 동·호수 추정 (건축물대장 전유부) ─────────────────────────
+
+BLD_URL = "https://apis.data.go.kr/1613000/BldRgstHubService/getBrExposPubuseAreaInfo"
+
+
+@st.cache_resource
+def expos_store() -> dict:
+    """건물별 호실 목록 캐시 (서버가 켜져 있는 동안 유지)"""
+    return {}
+
+
+def fetch_units(service_key: str, b_code: str, jibun: str):
+    """지번 → [(동, 호, 층, 전용면적)] 목록. 실패하면 오류 문자열"""
+    jb = jibun.replace("산", "").strip()
+    bun, _, ji = jb.partition("-")
+    if not bun.isdigit() or (ji and not ji.isdigit()) or len(b_code) != 10:
+        return []
+    units, page = {}, 1
+    while True:
+        try:
+            r = requests.get(BLD_URL, params={
+                "serviceKey": service_key, "sigunguCd": b_code[:5], "bjdongCd": b_code[5:],
+                "platGbCd": "1" if jibun.strip().startswith("산") else "0",
+                "bun": bun.zfill(4), "ji": (ji or "0").zfill(4),
+                "numOfRows": 500, "pageNo": page}, timeout=20)
+            root = ET.fromstring(r.text)
+        except Exception as e:
+            return f"연결 실패: {e}"
+        err = root.findtext(".//returnAuthMsg") or root.findtext(".//errMsg")
+        code = root.findtext(".//resultCode")
+        if err or (code not in (None, "00", "000")):
+            return err or f"{code} {root.findtext('.//resultMsg')}"
+        items = list(root.iter("item"))
+        for it in items:
+            g = {c.tag: (c.text or "").strip() for c in it}
+            if g.get("exposPubuseGbCd") not in ("1", "") and "전유" not in g.get("exposPubuseGbCdNm", ""):
+                continue
+            try:
+                flr = int(float(g.get("flrNo") or 0))
+                area = float(g.get("area") or 0)
+            except ValueError:
+                continue
+            if "지하" in g.get("flrGbCdNm", ""):
+                flr = -flr
+            key = (g.get("dongNm", ""), g.get("hoNm", ""), flr)
+            units[key] = units.get(key, 0.0) + area      # 한 호실의 전유면적 합산
+        if len(items) < 500:
+            break
+        page += 1
+    return [(d, h, f, a) for (d, h, f), a in units.items()]
+
+
+def guess_ho(units, floor, area_m2) -> str:
+    """같은 층 + 전용면적이 맞는 호실 후보"""
+    if not isinstance(units, list) or not units or pd.isna(floor):
+        return ""
+    for tol in (0.05, 0.5):
+        hits = [(d, h) for d, h, f, a in units if f == int(floor) and abs(a - area_m2) <= tol]
+        if hits:
+            break
+    if not hits:
+        return ""
+    def fmt(d, h):
+        h = h if h.endswith("호") else f"{h}호"
+        return f"{d} {h}".strip() if d and d not in ("주동", "0") else h
+    names = sorted({fmt(d, h) for d, h in hits})
+    return names[0] if len(names) == 1 else " / ".join(names[:3]) + (" 등" if len(names) > 3 else "") + "?"
+
+
 # ───────────────────────── 임장 동선 ─────────────────────────
 
 WALK_FACTOR = 1.3      # 직선거리 → 실제 걸음거리 보정
@@ -329,6 +400,63 @@ st.set_page_config(page_title="빌라 시세조사", page_icon="🏘️", layout
 st.title("빌라 시세조사")
 st.caption("이 동네에서 실제로 팔리는 빌라인지, 얼마에 팔 수 있는지 확인합니다.")
 
+# 휴대폰에서 맨 위에서 아래로 당길 때 페이지가 새로고침되지 않게 막음
+st.markdown("""<style>
+html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"], [data-testid="stMain"], section.main {
+  overscroll-behavior-y: contain;
+}
+</style>""", unsafe_allow_html=True)
+
+# 조회 조건을 주소창(URL)에 저장 → 새로고침돼도 같은 조건으로 자동 재조회
+qp = st.query_params
+
+
+def qnum(key, default, lo, hi, cast=int):
+    try:
+        v = cast(float(qp.get(key, default)))
+    except (TypeError, ValueError):
+        v = default
+    return min(max(v, lo), hi)
+
+
+# 처음 열릴 때만 주소창 값으로 입력칸을 채움 (이후에는 사용자가 바꾼 값 유지)
+_r = qnum("r", 300, 300, 1000)
+for k, v in {
+    "w_addr": qp.get("addr", ""),
+    "w_area": qnum("area", 42.0, 10.0, 200.0, float),
+    "w_year": qnum("year", 1990, 1960, date.today().year),
+    "w_floor": qnum("floor", 2, -2, 30),
+    "w_bid": qnum("bid", 6664, 0, 200000),
+    "w_m": qnum("m", 12, 6, 24),
+    "w_r": _r if _r in (300, 500, 700, 1000) else 300,
+    "w_at": qnum("at", 3, 1, 6),
+    "w_yt": qnum("yt", 5, 2, 15),
+    "w_rp": qnum("rp", 500, 0, 10000),
+    "w_ex": qnum("ex", 400, 0, 10000),
+    "w_pf": qnum("pf", 2500, 0, 20000),
+    "w_it": qp.get("it", "1") == "1",
+    "w_bk": qp.get("bk", "1") == "1",
+    "w_stn": qnum("stn", 0, 0, 4),
+    "w_mv": qp.get("mv", "0") == "1",
+    "sel_cur": set(filter(None, qp.get("sel", "").split(","))),
+}.items():
+    st.session_state.setdefault(k, v)
+if "ppy" in qp and "w_ppy" not in st.session_state:
+    st.session_state["w_ppy"] = qnum("ppy", 1000, 0, 100000)
+
+
+def reset_all():
+    st.query_params.clear()
+    st.session_state.clear()
+    st.session_state["_reset"] = True
+
+
+# 리셋 직후: 브라우저에 기억한 탭 위치도 지움
+if st.session_state.pop("_reset", False):
+    components.html("<script>try{localStorage.removeItem('villa_tab');window.parent.__villaRestored=false;}catch(e){}</script>",
+                    height=0)
+
+
 with st.sidebar:
     st.subheader("API 키")
     data_key = st.text_input("공공데이터포털 인증키", type="password",
@@ -337,22 +465,27 @@ with st.sidebar:
                               value=secret("KAKAO_REST_KEY"))
 
     st.subheader("경매 물건")
-    addr = st.text_input("주소 (지번 주소 권장)", placeholder="경기도 부천시 오정구 고강동 123-4")
+    addr = st.text_input("주소 (지번 주소 권장)", key="w_addr",
+                         placeholder="경기도 부천시 오정구 고강동 123-4")
     c1, c2 = st.columns(2)
-    area_m2 = c1.number_input("전용면적 ㎡", 10.0, 200.0, 42.0, 0.1)
-    build_year = c2.number_input("건축년도", 1960, date.today().year, 1990)
+    area_m2 = c1.number_input("전용면적 ㎡", 10.0, 200.0, step=0.1, key="w_area")
+    build_year = c2.number_input("건축년도", 1960, date.today().year, key="w_year")
     c3, c4 = st.columns(2)
-    floor = c3.number_input("층", -2, 30, 2)
-    min_bid = c4.number_input("최저가 (만원)", 0, 200000, 6664, 10)
+    floor = c3.number_input("층", -2, 30, key="w_floor")
+    min_bid = c4.number_input("최저가 (만원)", 0, 200000, step=10, key="w_bid")
 
     st.subheader("조회 조건")
-    months = st.slider("기간 (개월)", 6, 24, 12)
-    radius = st.select_slider("반경", [300, 500, 700, 1000], value=300, format_func=lambda v: f"{v}m")
-    area_tol = st.slider("전용평수 허용 범위 (±평)", 1, 6, 3)
-    age_tol = st.slider("연식 허용 범위 (±년)", 2, 15, 5)
+    months = st.slider("기간 (개월)", 6, 24, key="w_m")
+    radius = st.select_slider("반경", [300, 500, 700, 1000], key="w_r", format_func=lambda v: f"{v}m")
+    area_tol = st.slider("전용평수 허용 범위 (±평)", 1, 6, key="w_at")
+    age_tol = st.slider("연식 허용 범위 (±년)", 2, 15, key="w_yt")
     run = st.button("시세 조회", type="primary", use_container_width=True)
+    st.button("처음부터 다시 (리셋)", on_click=reset_all, use_container_width=True,
+              help="입력값, 선택한 임장지, 조정한 값을 모두 지우고 새로 시작합니다.")
 
-if run:
+auto = (not run and "trades" not in st.session_state and bool(qp.get("addr"))
+        and bool(data_key) and bool(kakao_key))
+if run or auto:
     missing = [n for n, v in [("공공데이터포털 인증키", data_key),
                               ("카카오 REST API 키", kakao_key),
                               ("물건 주소", addr.strip())] if not v]
@@ -394,6 +527,9 @@ if run:
         st.error("이 지역의 빌라 실거래가 없습니다. 기간을 늘려 보세요.")
         st.stop()
 
+    if run:  # 새로 조회하면 동네 선택은 새 주소 기준으로
+        st.session_state.pop("w_dong", None)
+        st.query_params.pop("dong", None)
     st.session_state.update(trades=trades, lat0=lat0, lon0=lon0, addr=addr,
                             sgg=" ".join(addr.split()[:-2]))
 
@@ -408,9 +544,39 @@ age = date.today().year - build_year
 
 dongs = sorted(trades["dong"].dropna().unique())
 guess = next((d for d in dongs if d in st.session_state.addr), dongs[0])
-dong = st.selectbox("동네", dongs, index=dongs.index(guess))
+if qp.get("dong") in dongs:
+    guess = qp.get("dong")
+if st.session_state.get("w_dong") not in dongs:
+    st.session_state["w_dong"] = guess
+dong = st.selectbox("동네", dongs, key="w_dong")
+
 dong_df = trades[trades["dong"] == dong]
 print_slot = st.container()
+
+# 마지막으로 보던 탭을 기억했다가 새로고침 후 다시 열어 줌
+components.html("""<script>
+(function () {
+  const KEY = 'villa_tab';
+  let doc; try { doc = window.parent.document; } catch (e) { return; }
+  function setup(tries) {
+    const tabs = [...doc.querySelectorAll('button[role="tab"]')];
+    if (!tabs.length) { if (tries < 40) setTimeout(() => setup(tries + 1), 150); return; }
+    tabs.forEach(t => { if (!t.dataset.vs) { t.dataset.vs = 1;
+      t.addEventListener('click', () => localStorage.setItem(KEY, t.innerText.trim())); } });
+    if (!window.parent.__villaRestored) {
+      window.parent.__villaRestored = true;
+      const want = localStorage.getItem(KEY);
+      const b = tabs.find(t => t.innerText.trim() === want);
+      if (b && b.getAttribute('aria-selected') !== 'true') b.click();
+    }
+  }
+  setup(0);
+  // 화면이 다시 그려져 탭 버튼이 새로 생겨도 클릭을 계속 기억하도록
+  setInterval(() => { [...doc.querySelectorAll('button[role="tab"]')].forEach(t => {
+    if (!t.dataset.vs) { t.dataset.vs = 1;
+      t.addEventListener('click', () => localStorage.setItem(KEY, t.innerText.trim())); } }); }, 1000);
+})();
+</script>""", height=0)
 report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None}
 
 tab1, tab2, tab3 = st.tabs(["동네 프로필", "비교사례", "예상 매도가"])
@@ -471,20 +637,53 @@ with tab2:
         map_slot = st.container()
 
         comps = comps.reset_index(drop=True)
+        # 동·호수 추정: 건물별 호실 목록을 받아 층·전용면적으로 대조
+        store = expos_store()
+        todo = {}
+        for q, jb in zip(comps["q"], comps["jibun"]):
+            bc = (geo.get(q) or [None, None, ""])[2] or ""
+            if (bc, jb) not in store:
+                todo[(bc, jb)] = None
+        if todo:
+            with st.spinner(f"건축물대장에서 {len(todo)}개 건물의 호실 확인 중"):
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    for k, res in zip(todo, ex.map(lambda k: fetch_units(data_key, k[0], k[1]), todo)):
+                        store[k] = res
+        units_of = {q: store.get(((geo.get(q) or [None, None, ""])[2] or "", jb), [])
+                    for q, jb in zip(comps["q"], comps["jibun"])}
+        errs = {v for v in units_of.values() if isinstance(v, str)}
+        if errs:
+            st.warning(f"동·호수를 확인하지 못했습니다: {next(iter(errs))}. "
+                       "공공데이터포털에서 '건축HUB_건축물대장정보 서비스' 승인 상태를 확인하세요.")
+            for k in [k for k, v in store.items() if isinstance(v, str)]:
+                store.pop(k)  # 다음 조회 때 다시 시도
+        comps["ho"] = [guess_ho(units_of[q], f, a)
+                       for q, f, a in zip(comps["q"], comps["floor"], comps["area_m2"])]
+
         show = comps.assign(
             거래일=comps["deal_date"].dt.strftime("%y.%m.%d"),
             거리=comps["dist_m"].round().astype(int).astype(str) + "m",
             전용평=comps["area_py"].round(1),
             금액=comps["price"].map(won),
             평단가=comps["ppy"].round().astype(int),
-        )[["거래일", "name", "jibun", "거리", "전용평", "build_year", "floor", "금액", "평단가"]]
+        )[["거래일", "name", "ho", "jibun", "거리", "전용평", "build_year", "floor", "금액", "평단가"]]
         report["comps"] = show
-        st.caption("임장할 거래를 표 왼쪽 칸에서 여러 개 선택하면, 아래에 지하철역 기준 방문 순서가 나옵니다.")
-        event = st.dataframe(
-            show.rename(columns={"name": "건물명", "jibun": "지번", "build_year": "건축년도", "floor": "층"}),
-            hide_index=True, use_container_width=True,
-            on_select="rerun", selection_mode="multi-row", key="comp_table")
-        sel_rows = list(event.selection.rows) if event else []
+        st.caption("임장할 곳의 '임장' 칸을 체크하면, 아래에 지하철역 기준 방문 순서가 나옵니다.")
+        st.caption("동·호는 실거래의 층·전용면적을 건축물대장과 대조한 추정입니다. '?'가 붙으면 후보가 여러 개입니다.")
+        ids = [hashlib.md5(f"{q}|{d}|{f}|{p}".encode()).hexdigest()[:6]
+               for q, d, f, p in zip(comps["q"], comps["deal_date"], comps["floor"], comps["price"])]
+        ed_key = "ed_" + hashlib.md5("|".join(ids).encode()).hexdigest()[:8]
+        init = st.session_state.setdefault(
+            "init_" + ed_key, [i in st.session_state.sel_cur for i in ids])
+        ed_df = show.rename(columns={"name": "건물명", "ho": "동·호", "jibun": "지번",
+                                     "build_year": "건축년도", "floor": "층"})
+        ed_df.insert(0, "임장", init)
+        edited = st.data_editor(
+            ed_df, key=ed_key, hide_index=True, use_container_width=True,
+            disabled=[c for c in ed_df.columns if c != "임장"],
+            column_config={"임장": st.column_config.CheckboxColumn("임장", width="small")})
+        sel_rows = [i for i, v in enumerate(edited["임장"].tolist()) if v]
+        st.session_state.sel_cur = {ids[i] for i in sel_rows}
         sel_qs = list(dict.fromkeys(comps.loc[sel_rows, "q"]))  # 같은 건물 여러 거래는 한 곳으로
 
         # 같은 지번의 여러 거래를 한 점으로 묶고, 점을 누르면 내역이 보이게 함
@@ -493,8 +692,8 @@ with tab2:
             name, jibun = str(g["name"].iloc[0]), str(g["jibun"].iloc[0])
             title = name if jibun in name else f"{name} ({jibun})"
             lines = "\n".join(
-                f"{d:%y.%m.%d} · {f:.0f}층 · {won(p)} (평당 {pp:,.0f}만)"
-                for d, f, p, pp in zip(g["deal_date"], g["floor"], g["price"], g["ppy"]))
+                f"{d:%y.%m.%d} · {ho or f'{f:.0f}층'} · {won(p)} (평당 {pp:,.0f}만)"
+                for d, f, ho, p, pp in zip(g["deal_date"], g["floor"], g["ho"], g["price"], g["ppy"]))
             return pd.Series({
                 "lat": g["lat"].iloc[0], "lon": g["lon"].iloc[0], "title": title,
                 "label": f"{title} · {g['dist_m'].iloc[0]:.0f}m\n"
@@ -517,8 +716,8 @@ with tab2:
         if sel_qs:
             st.markdown("#### 임장 동선")
             r1, r2 = st.columns(2)
-            include_target = r1.checkbox("경매 물건도 들르기", value=True)
-            back = r2.checkbox("마지막에 역으로 돌아오기", value=True)
+            include_target = r1.checkbox("경매 물건도 들르기", key="w_it")
+            back = r2.checkbox("마지막에 역으로 돌아오기", key="w_bk")
             stops = [dict(name=row.title, lat=row.lat, lon=row.lon)
                      for row in grouped.set_index("q").loc[sel_qs].itertuples()]
             if include_target:
@@ -531,7 +730,9 @@ with tab2:
                 station = dict(name="경매 물건", lat=lat0, lon=lon0)
                 stops = [p for p in stops if p["name"] != "경매 물건"] or stops
             else:
-                pick = st.selectbox("출발역", range(len(stations)),
+                if st.session_state.get("w_stn", 0) >= len(stations):
+                    st.session_state["w_stn"] = 0
+                pick = st.selectbox("출발역", range(len(stations)), key="w_stn",
                                     format_func=lambda i: f"{stations[i]['name']} (중심에서 {stations[i]['dist']:,}m)")
                 station = stations[pick]
             route = plan_route(station, stops, back)
@@ -589,7 +790,7 @@ with tab2:
             map_style=LIGHT_MAP,  # 컴퓨터가 다크 모드여도 항상 밝은 지도
         )
         with map_slot:
-            move = st.toggle("지도 움직이기 (확대·이동)", value=False,
+            move = st.toggle("지도 움직이기 (확대·이동)", key="w_mv",
                              help="끄면 지도 위에서 손가락으로 화면을 스크롤할 수 있습니다.")
             deck.views = [pdk.View(type="MapView", controller=True if move else False)]
             try:
@@ -610,7 +811,13 @@ with tab3:
             st.warning(
                 f"평단가가 {won(est['min'])}~{won(est['max'])}으로 {est['spread']:.1f}배 차이 납니다. "
                 f"이상치 {est['n_out']}건은 업계약(컨설팅 작업) 가능성이 있어 계산에서 뺐습니다.")
-        ppy = st.number_input("적용 평단가 (만원)", value=int(round(est["median"])), step=10,
+        sig = (int(round(est["median"])), est["n"])
+        if st.session_state.get("ppy_sig") != sig:
+            # 비교사례가 바뀌면 새 중앙값으로, 주소창에서 복원한 값이 있으면 첫 번째에는 그대로 둠
+            if not (st.session_state.get("ppy_sig") is None and "w_ppy" in st.session_state):
+                st.session_state["w_ppy"] = sig[0]
+            st.session_state["ppy_sig"] = sig
+        ppy = st.number_input("적용 평단가 (만원)", step=10, key="w_ppy",
                               help="이상치를 뺀 중앙값이 기본값입니다. 현장 비교 후 조정하세요.")
         sell = ppy * area_py
         a, b, c = st.columns(3)
@@ -626,9 +833,9 @@ with tab3:
 
         st.markdown("**입찰가 역산**")
         x1, x2, x3 = st.columns(3)
-        repair = x1.number_input("수리비 (만원)", 0, 10000, 500, 50)
-        extra = x2.number_input("부대비용 (취득세·명도·중개 등, 만원)", 0, 10000, 400, 50)
-        profit = x3.number_input("희망 차익 (세전, 만원)", 0, 20000, 2500, 100)
+        repair = x1.number_input("수리비 (만원)", 0, 10000, step=50, key="w_rp")
+        extra = x2.number_input("부대비용 (취득세·명도·중개 등, 만원)", 0, 10000, step=50, key="w_ex")
+        profit = x3.number_input("희망 차익 (세전, 만원)", 0, 20000, step=100, key="w_pf")
         bid = sell - repair - extra - profit
         st.metric("최대 입찰가", won(bid), delta=f"최저가 대비 {won(bid - min_bid)}" if bid >= min_bid
                   else f"최저가보다 {won(min_bid - bid)} 낮음", delta_color="normal" if bid >= min_bid else "inverse")
@@ -694,14 +901,24 @@ def build_report_html() -> str:
     show = report.get("comps")
     if show is not None and len(show):
         parts.append(f"<h2>비교사례 {len(show)}건 · 반경 {radius}m · 전용 ±{area_tol}평 · 연식 ±{age_tol}년</h2><table><tr>")
-        headers = ["거래일", "건물명", "지번", "거리", "전용평", "건축년도", "층", "금액", "평단가(만)"]
-        parts.append("".join(f"<th>{h}</th>" for h in headers) + "</tr>")
-        for row in show.itertuples(index=False):
-            v = list(row)
-            parts.append(
-                f"<tr><td>{e(str(v[0]))}</td><td>{e(str(v[1]))}</td><td>{e(str(v[2]))}</td><td class='num'>{v[3]}</td>"
-                f"<td class='num'>{v[4]:.1f}</td><td class='num'>{v[5]:.0f}</td><td class='num'>{v[6]:.0f}</td>"
-                f"<td class='num'>{e(str(v[7]))}</td><td class='num'>{v[8]:,}</td></tr>")
+        cols = [("거래일", "거래일", ""), ("name", "건물명", ""), ("ho", "동·호", ""), ("jibun", "지번", ""),
+                ("거리", "거리", "num"), ("전용평", "전용평", "num1"), ("build_year", "건축년도", "num0"),
+                ("floor", "층", "num0"), ("금액", "금액", "num"), ("평단가", "평단가(만)", "numc")]
+        parts.append("".join(f"<th>{h}</th>" for _, h, _ in cols) + "</tr>")
+        for _, row in show.iterrows():
+            cells = []
+            for c, _, kind in cols:
+                v = row.get(c, "")
+                if kind == "num1":
+                    txt = f"{v:.1f}"
+                elif kind == "num0":
+                    txt = "" if pd.isna(v) else f"{v:.0f}"
+                elif kind == "numc":
+                    txt = f"{v:,}"
+                else:
+                    txt = e(str(v))
+                cells.append(f"<td class='num'>{txt}</td>" if kind else f"<td>{txt}</td>")
+            parts.append("<tr>" + "".join(cells) + "</tr>")
         parts.append("</table>")
     parts.append("</body></html>")
     return "".join(parts)
@@ -731,3 +948,17 @@ document.getElementById('pbtn').onclick = () => {{
         st.download_button("보고서 저장 (HTML)", report_html.encode("utf-8"),
                            file_name=f"빌라시세_{dong}_{date.today():%Y%m%d}.html",
                            mime="text/html", use_container_width=True)
+
+
+# ───────────────────────── 현재 상태를 주소창에 기록 ─────────────────────────
+# 새로고침하거나 홈 화면 아이콘으로 열어도 같은 화면으로 복원됨
+ss = st.session_state
+st.query_params.update({
+    "addr": ss.addr, "area": f"{area_m2:g}", "year": str(build_year), "floor": str(floor),
+    "bid": str(min_bid), "m": str(months), "r": str(radius), "at": str(area_tol), "yt": str(age_tol),
+    "dong": dong, "sel": ",".join(sorted(ss.get("sel_cur", set()))),
+    "it": "1" if ss.get("w_it", True) else "0", "bk": "1" if ss.get("w_bk", True) else "0",
+    "stn": str(ss.get("w_stn", 0)), "mv": "1" if ss.get("w_mv") else "0",
+    "rp": str(ss.get("w_rp", 500)), "ex": str(ss.get("w_ex", 400)), "pf": str(ss.get("w_pf", 2500)),
+    **({"ppy": str(ss["w_ppy"])} if "w_ppy" in ss else {}),
+})
