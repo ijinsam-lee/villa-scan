@@ -491,15 +491,15 @@ with st.sidebar:
 
     st.subheader("경매 물건")
     addr = st.text_input("주소 (지번 주소 권장)", key="w_addr",
-                         placeholder="경기도 부천시 오정구 고강동 123-4")
+                         help="예: 경기도 부천시 오정구 고강동 123-4")
     c1, c2 = st.columns(2)
     area_m2 = c1.number_input("전용면적 ㎡", 10.0, 200.0, step=0.1, key="w_area")
     build_year = c2.number_input("건축년도", 1960, date.today().year, key="w_year")
     c3, c4 = st.columns(2)
     floor = c3.number_input("층", -2, 30, key="w_floor")
     min_bid = c4.number_input("최저가 (만원)", 0, 200000, step=10, key="w_bid")
-    ho_in = st.text_input("호수 (선택)", key="w_ho", placeholder="예: 301",
-                          help="넣으면 건물 정보 탭에서 그 호실의 서류상 용도와 면적을 확인합니다.")
+    ho_in = st.text_input("호수 (선택)", key="w_ho",
+                          help="예: 301. 넣으면 건물 정보 탭에서 그 호실의 서류상 용도와 면적을 확인합니다.")
 
     st.subheader("조회 조건")
     months = st.slider("기간 (개월)", 6, 24, key="w_m")
