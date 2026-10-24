@@ -405,6 +405,63 @@ def kakao_route_link(a: dict, b: dict) -> str:
     return f"https://map.kakao.com/link/from/{pt(a)}/to/{pt(b)}"
 
 
+# ───────────────────────── 임장 체크리스트 ─────────────────────────
+
+CHECKLIST = [
+    ("집에서 손품 (출발 전)", [
+        ("p1", "매각물건명세서: 대항력 있는 임차인, 인수되는 권리, 비고란(위반건축물·유치권 신고) 확인"),
+        ("p2", "등기부 갑구·을구에서 말소기준권리와 그보다 앞선 권리 확인"),
+        ("p3", "건물 정보 탭: 근생 호실·주차·엘리베이터 확인, 정부24 건축물대장으로 위반건축물 표시 확인"),
+        ("p4", "예상 매도가를 집에서 먼저 정하기 (부동산에 \"얼마에 팔려요?\"부터 묻지 않기)"),
+        ("p5", "로드뷰로 골목 경사, 계단, 주차 공간, 주변 건물 상태 미리 보기"),
+        ("p6", "비교사례 중 임장할 곳을 체크해 동선 짜기 (비교 평가 2~3곳)"),
+    ]),
+    ("건물 외부", [
+        ("o1", "외벽 균열, 하얀 백화 자국(누수 흔적), 보수 공사 흔적"),
+        ("o2", "옥상 방수 상태, 옥탑·불법 증축 여부 (최상층이면 특히)"),
+        ("o3", "실제 주차 가능 대수와 진입로 폭 (대장상 대수와 비교)"),
+        ("o4", "공용 계단·복도 청결, 조명, 쓰레기 관리 → 관리 수준"),
+        ("o5", "1층 상가·필로티 여부, 소음·냄새 나는 업종"),
+    ]),
+    ("호실 (가능한 범위에서)", [
+        ("u1", "우편함: 점유자 이름, 체납 고지서, 우편물 쌓임 → 점유 상태 추정"),
+        ("u2", "전기·가스·수도 계량기가 도는지 → 공실 여부"),
+        ("u3", "현관문 상태, 전단지 쌓임"),
+        ("u4", "창호(샷시) 상태, 결로·곰팡이 흔적 (지하·북향이면 특히)"),
+        ("u5", "보일러 연통으로 보일러 연식 추정"),
+        ("u6", "윗집·아랫집에 누수 이력 물어보기"),
+    ]),
+    ("동네와 수요 (누구에게 팔까)", [
+        ("n1", "평형이 이 동네 매수층(가구원 수)과 맞는지"),
+        ("n2", "초등학교, 마트, 버스·지하철까지 실제로 걸어 보기"),
+        ("n3", "같은 골목 비교 매물 2~3곳과 외관·층·주차 비교"),
+        ("n4", "주변 신축 공급(경쟁 매물)과 재개발·모아타운 등 이슈"),
+    ]),
+    ("부동산 방문 (선택)", [
+        ("r1", "내 예상가를 먼저 정하고 \"이 가격이면 얼마나 걸려요?\"로 확인"),
+        ("r2", "급매 가격, 대기 매물 수, 전세 시세(전세가율)"),
+        ("r3", "사장님이 직접 입찰한다고 하면 한 번 의심하기 (단독 입찰일 수도 있음)"),
+    ]),
+    ("입찰 전 마지막 확인", [
+        ("b1", "최대 입찰가 = 예상 매도가 − (수리비 + 부대비용 + 희망 수익) 재계산"),
+        ("b2", "대출 가능 여부 확인 (근생·위반건축물은 대출이 어려움)"),
+        ("b3", "입찰보증금 준비 (보통 최저가의 10%, 재매각은 20%)"),
+        ("b4", "명도 계획: 점유자 유형(소유자·임차인·공실)별 예상 비용과 기간"),
+    ]),
+]
+
+KEY_NOTES = """
+- **싸다고 사지 말고, 팔리는 물건을 싸게 산다.** 시세보다 싸다는 사실만으로는 팔리지 않습니다.
+- **잘 팔리는 빌라는 동네마다 다르다.** 동네 프로필 탭에서 가격대·평수·연식·층을 먼저 확인합니다.
+- **손품이 임장보다 중요하다.** 잘 팔릴 가능성이 높은 물건만 골라 임장 가고, 현장에서는 확인만 합니다.
+- **경매 낙찰자 매물이 많은 동네는 조심한다.** 낙찰자끼리 급매 경쟁을 하게 되고, 이건 내가 바꿀 수 없는 변수입니다.
+- **매물 소화 기간은 바꿀 수 있다.** 더 싸게 받고 수리를 잘하면 내 물건 순서를 앞당길 수 있습니다.
+- **평단가 편차가 크면 업계약을 의심한다.** 예상 매도가 탭의 경고를 보고 이상치는 빼고 판단합니다.
+- **세후 수익은 역산한다.** 매매사업자 6~15% 구간 기준 대략 차익 2,500만 → 세후 1천만, 4,000만 → 2천만, 5,000만 → 3천만 정도입니다(강의 기준 어림값, 실제 세율로 다시 계산).
+- **처음엔 작게 한 사이클을 완주한다.** 낙찰 → 명도 → 수리 → 매도까지 세후 1천만 원 목표로 경험을 쌓습니다.
+"""
+
+
 # ───────────────────────── 차트 ─────────────────────────
 
 def bin_chart(dist: pd.Series, highlight=None, height=200):
@@ -474,6 +531,7 @@ for k, v in {
     "w_stn": qnum("stn", 0, 0, 4),
     "w_mv": qp.get("mv", "0") == "1",
     "sel_cur": set(filter(None, qp.get("sel", "").split(","))),
+    "ck_done": set(filter(None, qp.get("ck", "").split(","))),
 }.items():
     st.session_state.setdefault(k, v)
 if "ppy" in qp and "w_ppy" not in st.session_state:
@@ -615,9 +673,9 @@ components.html("""<script>
       t.addEventListener('click', () => localStorage.setItem(KEY, t.innerText.trim())); } }); }, 1000);
 })();
 </script>""", height=0)
-report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None}
+report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None, "ck": None}
 
-tab1, tab2, tab3, tab4 = st.tabs(["동네 프로필", "비교사례", "예상 매도가", "건물 정보"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["동네 프로필", "비교사례", "예상 매도가", "건물 정보", "임장 체크"])
 
 # ── 동네 프로필
 with tab1:
@@ -999,6 +1057,46 @@ with tab4:
             {"ok": st.success, "warn": st.warning, "err": st.error, "info": st.info}[kind](msg)
         report["bld"] = bld
 
+# ── 임장 체크리스트
+with tab5:
+    ss = st.session_state
+    # 이 물건에서 특히 볼 것: 다른 탭의 분석 결과에서 자동으로 뽑음
+    focus = []
+    bl = report.get("bld") or {}
+    focus += [m for k, m in bl.get("checks", []) if k in ("warn", "err")]
+    r_est = report.get("est")
+    if r_est and (r_est["est"]["spread"] >= 2.0 or r_est["est"]["n_out"] > 0):
+        focus.append("평단가 편차가 커서 업계약 가능성이 있습니다. 부동산에서 실제 거래 가능 가격을 꼭 확인하세요.")
+    if report.get("verdict") and "모두" not in report["verdict"]:
+        focus.append("동네 프로필과 맞지 않는 항목이 있습니다. 이 물건을 누구에게 팔지 현장에서 다시 따져 보세요.")
+    if floor < 1:
+        focus.append("지하·반지하 호실입니다. 습기·결로·곰팡이, 채광, 침수 이력을 꼭 확인하세요.")
+    if age >= 30:
+        focus.append(f"{age}년 된 건물입니다. 누수 흔적, 배관 교체 여부, 외벽 균열을 집중해서 보세요.")
+    if focus:
+        st.markdown("#### 이 물건에서 특히 볼 것")
+        for m in focus:
+            st.warning(m)
+
+    total = sum(len(items) for _, items in CHECKLIST)
+    for _, items in CHECKLIST:
+        for cid, _ in items:
+            st.session_state.setdefault(f"ck_{cid}", cid in ss.ck_done)
+    done = sum(ss.get(f"ck_{cid}", False) for _, items in CHECKLIST for cid, _ in items)
+    st.progress(done / total, text=f"체크리스트 {done}/{total}")
+
+    for section, items in CHECKLIST:
+        # 제목을 고정해야 체크할 때마다 펼친 칸이 접히지 않음
+        with st.expander(section, expanded=False):
+            for cid, text in items:
+                st.checkbox(text, key=f"ck_{cid}")
+    ss.ck_done = {cid for _, items in CHECKLIST for cid, _ in items if ss.get(f"ck_{cid}")}
+
+    with st.expander("참고 중요사항 (강의 핵심 원칙)"):
+        st.markdown(KEY_NOTES)
+    st.caption("체크한 항목은 새로고침해도 유지되고, 리셋하면 지워집니다. 인쇄 보고서에도 들어갑니다.")
+    report["ck"] = dict(focus=focus, done=ss.ck_done)
+
 
 # ───────────────────────── 인쇄용 보고서 ─────────────────────────
 
@@ -1086,6 +1184,16 @@ def build_report_html() -> str:
                 cells.append(f"<td class='num'>{txt}</td>" if kind else f"<td>{txt}</td>")
             parts.append("<tr>" + "".join(cells) + "</tr>")
         parts.append("</table>")
+    ck = report.get("ck")
+    if ck is not None:
+        parts.append("<h2>임장 체크리스트</h2>")
+        for m in ck["focus"]:
+            parts.append(f"<div class='box warn'>{e(m)}</div>")
+        for section, items in CHECKLIST:
+            parts.append(f"<p style='margin:8px 0 2px'><b>{e(section)}</b></p>")
+            for cid, text in items:
+                mark = "☑" if cid in ck["done"] else "☐"
+                parts.append(f"<div style='margin:2px 0 2px 8px'>{mark} {e(text)}</div>")
     parts.append("</body></html>")
     return "".join(parts)
 
@@ -1126,6 +1234,7 @@ st.query_params.update({
     "addr": ss.addr, "area": f"{area_m2:g}", "year": str(build_year), "floor": str(floor),
     "bid": str(min_bid), "ho": ss.get("w_ho", ""), "m": str(months), "r": str(radius), "at": str(area_tol), "yt": str(age_tol),
     "dong": dong, "sel": ",".join(sorted(ss.get("sel_cur", set()))),
+    "ck": ",".join(sorted(ss.get("ck_done", set()))),
     "it": "1" if ss.get("w_it", True) else "0", "bk": "1" if ss.get("w_bk", True) else "0",
     "stn": str(ss.get("w_stn", 0)), "mv": "1" if ss.get("w_mv") else "0",
     "rp": str(ss.get("w_rp", 500)), "ex": str(ss.get("w_ex", 400)), "pf": str(ss.get("w_pf", 2500)),
