@@ -873,6 +873,291 @@ GUIDES = {
 }
 
 
+# ───────────────────────── 지역 찾기 (구를 고르면 동 순위) ─────────────────────────
+
+REGIONS = {
+    "서울": ["종로구", "중구", "용산구", "성동구", "광진구", "동대문구", "중랑구", "성북구", "강북구", "도봉구",
+             "노원구", "은평구", "서대문구", "마포구", "양천구", "강서구", "구로구", "금천구", "영등포구", "동작구",
+             "관악구", "서초구", "강남구", "송파구", "강동구"],
+    "인천": ["중구", "동구", "미추홀구", "연수구", "남동구", "부평구", "계양구", "서구", "강화군"],
+    "경기": ["수원시 장안구", "수원시 권선구", "수원시 팔달구", "수원시 영통구", "성남시 수정구", "성남시 중원구",
+             "성남시 분당구", "의정부시", "안양시 만안구", "안양시 동안구", "부천시 원미구", "부천시 소사구",
+             "부천시 오정구", "광명시", "평택시", "안산시 상록구", "안산시 단원구", "고양시 덕양구",
+             "고양시 일산동구", "고양시 일산서구", "과천시", "구리시", "남양주시", "오산시", "시흥시", "군포시",
+             "의왕시", "하남시", "용인시 처인구", "용인시 기흥구", "용인시 수지구", "파주시", "이천시", "안성시",
+             "김포시", "화성시", "광주시", "양주시", "포천시", "동두천시", "여주시"],
+}
+SIDO_FULL = {"서울": "서울특별시", "인천": "인천광역시", "경기": "경기도"}
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 30, show_spinner=False)
+def region_info(kakao_key: str, full_name: str):
+    """'서울특별시 구로구' → (시군구코드 5자리, 위도, 경도). 코드는 카카오 주소 검색 결과에서 가져옴"""
+    try:
+        r = requests.get(KAKAO_URL, params={"query": full_name},
+                         headers={"Authorization": f"KakaoAK {kakao_key.strip()}"}, timeout=10)
+        docs = r.json().get("documents", [])
+    except Exception:
+        return None
+    for d in docs:
+        ad = d.get("address") or {}
+        code = (ad.get("b_code") or ad.get("h_code") or "")[:5]
+        if code:
+            return code, float(d["y"]), float(d["x"])
+    return None
+
+
+def rank_dongs(trades: pd.DataFrame, rents: pd.DataFrame, min_n: int) -> pd.DataFrame:
+    """법정동별 거래량·추세·전세가율·시세 안정성 → 종합 점수"""
+    if trades.empty:
+        return pd.DataFrame()
+    cur = pd.Timestamp(date.today()).to_period("M")
+    t = trades.dropna(subset=["deal_date"]).copy()
+    t["ym"] = t["deal_date"].dt.to_period("M")
+    done = t[t["ym"] < cur]                                  # 이번 달(신고 덜 됨) 제외
+    rec_m = [cur - i for i in (1, 2, 3)]
+    prev_m = [cur - i for i in (4, 5, 6)]
+    rows = []
+    for (region, dong), g in t.groupby(["region", "dong"]):
+        if len(g) < min_n:
+            continue
+        gd = done[(done["region"] == region) & (done["dong"] == dong)]
+        r_n, p_n = gd["ym"].isin(rec_m).sum(), gd["ym"].isin(prev_m).sum()
+        c_chg = (r_n / p_n - 1) * 100 if p_n else (100.0 if r_n else 0.0)
+        r_p, p_p = gd[gd["ym"].isin(rec_m)]["ppy"].median(), gd[gd["ym"].isin(prev_m)]["ppy"].median()
+        # 직전 3개월이나 최근 3개월에 거래가 없으면 가격 비교를 하지 않음(0으로 둠)
+        p_chg = (r_p / p_p - 1) * 100 if (not pd.isna(p_p) and p_p and not pd.isna(r_p)) else 0.0
+        ppy = g["ppy"].median()
+        q1, q3 = g["ppy"].quantile(0.25), g["ppy"].quantile(0.75)
+        cv = (q3 - q1) / ppy if ppy and not pd.isna(ppy) else 1.0
+        j_ratio = None
+        if not rents.empty:
+            rj = rents[(rents["region"] == region) & (rents["dong"] == dong) & (rents["kind"] == "전세")]
+            if rj["ctype"].str.contains("신규").any():
+                rj = rj[rj["ctype"].str.contains("신규")]
+            if len(rj) >= 3 and ppy:
+                j_ratio = rj["dep_ppy"].median() / ppy
+        rows.append(dict(region=region, dong=dong, n=len(g), c_chg=c_chg, p_chg=p_chg, ppy=ppy,
+                         price=g["price"].median(), cv=cv, j_ratio=j_ratio))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    vol_s = df["n"].rank(pct=True) * 100
+    trend_s = (df["c_chg"].clip(-100, 200) + df["p_chg"].clip(-20, 20) * 3).rank(pct=True) * 100
+    stab_s = (-df["cv"]).rank(pct=True) * 100
+    jeonse_s = df["j_ratio"].map(lambda r: 50.0 if r is None or pd.isna(r)
+                                 else max(0.0, 100 - abs(r * 100 - 70) * 3))
+    df["score"] = (vol_s * 0.4 + trend_s.fillna(50) * 0.2 + jeonse_s * 0.2
+                   + stab_s.fillna(50) * 0.2).round(0).fillna(0)
+    return df.sort_values("score", ascending=False).reset_index(drop=True)
+
+
+GUIDE_REGION = """
+**왜 보나요?** 빌라는 **팔리는 동네**에서 사야 합니다. 같은 구 안에서도 동마다 거래량과 분위기가 크게 다릅니다.
+
+**읽는 법**
+- **점수**(100점) = 거래량 40% + 시장 추세 20% + 전세가율 20% + 시세 안정성 20%
+- **거래**: 예산·평수 조건에 맞는 최근 거래 건수입니다. 많을수록 내 물건도 팔기 쉽습니다.
+- **거래 추세·가격 추세**: 최근 3개월을 직전 3개월과 비교합니다(이번 달 제외).
+- **전세가율**: 70% 근처를 가장 높게 칩니다. 너무 높으면 역전세 위험, 너무 낮으면 전세로 회수가 어렵습니다.
+- **시세 안정**: 평단가가 고르게 분포할수록 '높음'입니다. '낮음'이면 업계약·시세 왜곡을 조심하세요.
+
+**활용 순서**: 마음에 드는 동을 고르고 **'이 동 분석하기'**를 누르면 그 동의 동네 프로필(잘 팔리는 유형)로 넘어갑니다.
+
+**한계**: 경매 낙찰가율·경쟁률·경매 낙찰자 매물 비율은 자료가 없어 반영하지 않았습니다.
+"""
+
+
+# ───────────────────────── 생활권 (상가정보) ─────────────────────────
+
+STORE_URL = "https://apis.data.go.kr/B553077/api/open/sdsc2/storeListInRadius"
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def stores_in_radius(service_key: str, lat: float, lon: float, radius: int):
+    """반경 안 상가업소 전체 → DataFrame, 실패하면 오류 문자열"""
+    items, page = [], 1
+    while page <= 20:
+        try:
+            r = requests.get(STORE_URL, params={"serviceKey": service_key, "radius": radius, "cx": lon, "cy": lat,
+                                                "type": "json", "numOfRows": 1000, "pageNo": page}, timeout=20)
+            js = r.json()
+        except Exception as e:
+            txt = locals().get("r").text[:200] if locals().get("r") is not None else str(e)
+            return f"상가정보 조회 실패: {txt}"
+        head = js.get("header", {})
+        if head.get("resultCode") not in ("00", None):
+            if head.get("resultCode") == "03":        # 데이터 없음
+                break
+            return f"{head.get('resultCode')} {head.get('resultMsg')}"
+        body = js.get("body", {})
+        chunk = body.get("items") or []
+        items += chunk
+        if len(items) >= int(body.get("totalCount") or 0) or not chunk:
+            break
+        page += 1
+    df = pd.DataFrame(items)
+    if df.empty:
+        return df
+    for c in ["indsLclsNm", "indsMclsNm", "indsSclsNm", "bizesNm"]:
+        df[c] = df.get(c, "").fillna("").astype(str).str.strip()
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    return df.dropna(subset=["lat", "lon"])
+
+
+def store_counts(df: pd.DataFrame) -> dict:
+    l, m, sc = df["indsLclsNm"], df["indsMclsNm"], df["indsSclsNm"]
+    return {
+        "전체": len(df),
+        "학원": int(((l == "교육") & (m.str.contains("학원") | sc.str.contains("학원"))).sum()),
+        "병·의원": int(((l == "보건의료") & ~sc.str.contains("약국")).sum()),
+        "약국": int(sc.str.contains("약국").sum()),
+        "음식점": int(((l == "음식") & ~sc.str.contains("카페")).sum()),
+        "카페": int(sc.str.contains("카페").sum()),
+        "편의점": int(sc.str.contains("편의점").sum()),
+        "슈퍼·마트": int(sc.str.contains("슈퍼|마트|식료품").sum()),
+        "부동산": int((l == "부동산").sum()),
+    }
+
+
+# ───────────────────────── 지형·경사 (Open-Meteo 고도, 키 필요 없음) ─────────────────────────
+
+@st.cache_data(ttl=60 * 60 * 24 * 30, show_spinner=False)
+def fetch_elev(lats: tuple, lons: tuple):
+    """좌표들의 해발 높이(m). 약 90m 간격 지형 자료라 큰 언덕은 잡지만 골목 하나의 경사는 못 잡음"""
+    out = []
+    for i in range(0, len(lats), 100):
+        try:
+            r = requests.get("https://api.open-meteo.com/v1/elevation", params={
+                "latitude": ",".join(f"{v:.5f}" for v in lats[i:i + 100]),
+                "longitude": ",".join(f"{v:.5f}" for v in lons[i:i + 100])}, timeout=15)
+            out += r.json()["elevation"]
+        except Exception:
+            return None
+    return out
+
+
+def slope_label(pct: float) -> str:
+    a = abs(pct)
+    return "평지" if a < 3 else "완만" if a < 8 else "가파름" if a < 12 else "매우 가파름"
+
+
+def offset(lat: float, lon: float, dist_m: float, bearing_deg: float):
+    b = math.radians(bearing_deg)
+    return (lat + dist_m * math.cos(b) / 111_000,
+            lon + dist_m * math.sin(b) / (111_000 * math.cos(math.radians(lat))))
+
+
+# ───────────────────────── 브이월드: 토지특성 (지형높이·도로접면·용도지역·공시지가) ─────────────────────────
+
+VW_DOMAIN_DEFAULT = "https://villa-scan.streamlit.app"
+
+
+def make_pnu(b_code: str, jibun: str) -> str:
+    """법정동코드10 + 산여부(1 일반, 2 산) + 본번4 + 부번4"""
+    jb = (jibun or "").strip()
+    mountain = jb.startswith("산")
+    bun, _, ji = jb.replace("산", "").strip().partition("-")
+    if len(b_code) != 10 or not bun.isdigit() or (ji and not ji.isdigit()):
+        return ""
+    return f"{b_code}{'2' if mountain else '1'}{bun.zfill(4)}{(ji or '0').zfill(4)}"
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def fetch_land(vkey: str, domain: str, pnu: str):
+    """토지특성 최신 1건(dict). 실패하면 오류 문자열"""
+    yr = date.today().year
+    last_err = ""
+    for y in (None, yr, yr - 1, yr - 2):
+        params = {"key": vkey.strip(), "domain": domain, "pnu": pnu, "format": "json", "numOfRows": 100, "pageNo": 1}
+        if y:
+            params["stdrYear"] = y
+        try:
+            js = requests.get("https://api.vworld.kr/ned/data/getLandCharacteristics", params=params, timeout=15).json()
+        except Exception as e:
+            last_err = f"연결 실패: {e}"
+            continue
+        body = next(iter(js.values()), {}) if isinstance(js, dict) else {}
+        rows = body.get("field") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if rows:
+            return max(rows, key=lambda r: (r.get("stdrYear", ""), r.get("lastUpdtDt", "")))
+        last_err = body.get("resultMsg") or body.get("error", {}).get("text", "") or "자료 없음"
+    return last_err or "자료 없음"
+
+
+ROAD_SIDE_HELP = [
+    ("광대", "폭 25m 이상 큰길에 접함"), ("중로", "폭 12–25m 길에 접함"), ("소로", "폭 8–12m 길에 접함"),
+    ("세로", "폭 8m 미만 골목에 접함"), ("맹지", "길에 접하지 않은 땅(건축·대출에 불리)"),
+]
+
+
+def road_help(name: str) -> str:
+    base = next((t for k, t in ROAD_SIDE_HELP if k in name), "")
+    if "(가)" in name:
+        base += ", 차가 다닐 수 있음"
+    elif "(불)" in name:
+        base += ", 차가 다니기 어려움"
+    if "각지" in name:
+        base += ", 모퉁이 땅"
+    return base
+
+
+# ───────────────────────── 브이월드: 공동주택 공시가격 ─────────────────────────
+
+GUARANTEE_RATE = 1.26   # 전세보증보험 전세금 한도 ≈ 공시가격 × 140% × 전세가율 90% (기준은 바뀔 수 있음)
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def fetch_aphus(vkey: str, domain: str, pnu: str):
+    """이 지번 공동주택의 연도별·호별 공시가격 전체. 실패하면 오류 문자열"""
+    rows, page = [], 1
+    while page <= 10:
+        try:
+            js = requests.get("https://api.vworld.kr/ned/data/getApartHousingPriceAttr", params={
+                "key": vkey.strip(), "domain": domain, "pnu": pnu, "format": "json",
+                "numOfRows": 1000, "pageNo": page}, timeout=20).json()
+        except Exception as e:
+            return f"연결 실패: {e}"
+        body = next(iter(js.values()), {}) if isinstance(js, dict) else {}
+        chunk = body.get("field") or []
+        if isinstance(chunk, dict):
+            chunk = [chunk]
+        if not chunk and not rows:
+            return body.get("resultMsg") or "자료 없음"
+        rows += chunk
+        if len(rows) >= int(body.get("totalCount") or 0) or not chunk:
+            break
+        page += 1
+    df = pd.DataFrame(rows)
+    df["price"] = pd.to_numeric(df.get("pblntfPc"), errors="coerce")
+    df["area"] = pd.to_numeric(df.get("prvuseAr"), errors="coerce")
+    df["year"] = pd.to_numeric(df.get("stdrYear"), errors="coerce")
+    df["ho"] = df.get("hoNm", "").fillna("").astype(str).str.replace("호", "").str.strip()
+    df["dong_nm"] = df.get("dongNm", "").fillna("").astype(str).str.strip()
+    return df.dropna(subset=["price", "year"])
+
+
+def norm_ho(h: str) -> str:
+    return str(h).replace("호", "").strip().lstrip("0").upper()
+
+
+def target_aphus(df: pd.DataFrame, ho: str, area_m2: float) -> dict:
+    """최신 연도 공시가격에서 이 물건 호실(또는 같은 면적 후보) 찾기"""
+    yr = int(df["year"].max())
+    latest = df[df["year"] == yr].copy()
+    if ho:
+        mine = latest[latest["ho"].map(norm_ho) == norm_ho(ho)]
+        how = "호수 일치"
+    else:
+        mine = latest[(latest["area"] - area_m2).abs() <= 0.5]
+        how = "전용면적이 같은 호실"
+    hist = df[df["ho"].isin(mine["ho"])].groupby("year")["price"].median() if len(mine) else pd.Series(dtype=float)
+    return dict(year=yr, latest=latest, mine=mine, how=how, hist=hist)
+
+
 # ───────────────────────── 차트 ─────────────────────────
 
 def bin_chart(dist: pd.Series, highlight=None, height=200):
@@ -968,6 +1253,13 @@ for k, v in {
     "w_fk": qp.get("fk", "음식점"),
     "w_fb": qp.get("fb", "경매 물건 주변"),
     "w_tab": qp.get("tab", "동네 프로필"),
+    "w_mode": qp.get("mode", "물건 분석"),
+    "w_sr": qnum("sr", 500, 300, 1000),
+    "w_slp": qp.get("slp", "지하철역"),
+    "rf_sel": [x for x in qp.get("rf", "").split("|") if x],
+    "rf_pmin": qnum("rfp0", 5000, 0, 200000), "rf_pmax": qnum("rfp1", 20000, 0, 200000),
+    "rf_amin": qnum("rfa0", 8, 0, 60), "rf_amax": qnum("rfa1", 25, 0, 60),
+    "rf_minn": qnum("rfn", 5, 1, 50), "rf_rent": qp.get("rfj", "1") == "1",
     "sel_cur": set(filter(None, qp.get("sel", "").split(","))),
     "ck_done": set(filter(None, qp.get("ck", "").split(","))),
 }.items():
@@ -1024,12 +1316,30 @@ if st.session_state.pop("_reset", False):
     pass
 
 
+def sgg_of(address: str) -> str:
+    """주소에서 '시도 시군구' 부분만 (예: 경기도 부천시 오정구 고강동 123-4 → 경기도 부천시 오정구)"""
+    toks = address.split()
+    idx = [i for i, t in enumerate(toks) if t.endswith(("구", "시", "군"))]
+    return " ".join(toks[:idx[-1] + 1]) if idx else " ".join(toks[:-2])
+
+
+def _to_analysis():
+    st.session_state["w_mode"] = "물건 분석"
+
+
 with st.sidebar:
+    if st.session_state.get("w_mode") not in ("물건 분석", "지역 찾기"):
+        st.session_state["w_mode"] = "물건 분석"
+    st.radio("모드", ["물건 분석", "지역 찾기"], key="w_mode", horizontal=True,
+             help="지역 찾기: 구를 고르면 빌라 거래가 활발한 동을 순위로 보여줍니다.")
     st.subheader("API 키")
     data_key = st.text_input("공공데이터포털 인증키", type="password",
                              value=secret("DATA_GO_KR_KEY"))
     kakao_key = st.text_input("카카오 REST API 키", type="password",
                               value=secret("KAKAO_REST_KEY"))
+    vworld_key = st.text_input("브이월드 인증키 (선택)", type="password", value=secret("VWORLD_KEY"),
+                               help="넣으면 건물·입지 탭에 지형높이·도로접면·용도지역·공시지가가 나옵니다.")
+    vworld_domain = secret("VWORLD_DOMAIN") or VW_DOMAIN_DEFAULT
 
     st.subheader("경매 물건")
     addr = st.text_input("주소 (지번 주소 권장)", key="w_addr",
@@ -1048,9 +1358,161 @@ with st.sidebar:
     radius = st.select_slider("반경", [300, 500, 700, 1000], key="w_r", format_func=lambda v: f"{v}m")
     area_tol = st.slider("전용평수 허용 범위 (±평)", 1, 6, key="w_at")
     age_tol = st.slider("연식 허용 범위 (±년)", 2, 15, key="w_yt")
-    run = st.button("시세 조회", type="primary", use_container_width=True)
+    run = st.button("시세 조회", type="primary", use_container_width=True, on_click=_to_analysis)
     st.button("처음부터 다시 (리셋)", on_click=reset_all, use_container_width=True,
               help="입력값, 선택한 임장지, 조정한 값을 모두 지우고 새로 시작합니다.")
+
+# ───────────────────────── 지역 찾기 화면 ─────────────────────────
+def _analyze_dong(full_region: str, dong: str):
+    ss_ = st.session_state
+    for k in ["trades", "rents", "rent_key", "comps", "w_dong", "ppy_sig", "w_ppy"]:
+        ss_.pop(k, None)
+    ss_["w_mode"] = "물건 분석"
+    ss_["w_addr"] = f"{full_region} {dong}"
+    ss_["w_tab"] = "동네 프로필"
+    st.query_params["addr"] = f"{full_region} {dong}"
+    st.query_params["mode"] = "물건 분석"
+    st.query_params.pop("dong", None)
+
+
+if st.session_state.get("w_mode") == "지역 찾기" and not run:
+    ss = st.session_state
+    st.subheader("지역 찾기: 빌라 거래가 활발한 동")
+    with st.expander("📖 지역 찾기 읽는 법"):
+        st.markdown(GUIDE_REGION)
+    if not (data_key and kakao_key):
+        st.error("왼쪽 메뉴에 API 키 두 개를 넣어 주세요.")
+        st.stop()
+
+    options = [f"{sd} {g}" for sd, gs in REGIONS.items() for g in gs]
+    ss.rf_sel = [x for x in ss.rf_sel if x in options]
+    st.multiselect("지역 (여러 개 선택 가능, 3개 이하 권장)", options, key="rf_sel",
+                   placeholder="예: 서울 구로구")
+    with st.expander("조건 (예산·평수)", expanded=False):
+        c1, c2 = st.columns(2)
+        c1.number_input("매매가 최소 (만원)", 0, 200000, step=1000, key="rf_pmin")
+        c2.number_input("매매가 최대 (만원)", 0, 200000, step=1000, key="rf_pmax")
+        c3, c4 = st.columns(2)
+        c3.number_input("전용평수 최소", 0, 60, key="rf_amin")
+        c4.number_input("전용평수 최대", 0, 60, key="rf_amax")
+        c5, c6 = st.columns(2)
+        c5.number_input("동별 최소 거래 건수", 1, 50, key="rf_minn")
+        c6.checkbox("전세가율 포함", key="rf_rent", help="전월세 API가 승인되어 있어야 합니다.")
+    st.query_params.update({
+        "mode": "지역 찾기", "rf": "|".join(ss.rf_sel), "rfp0": str(ss.rf_pmin), "rfp1": str(ss.rf_pmax),
+        "rfa0": str(ss.rf_amin), "rfa1": str(ss.rf_amax), "rfn": str(ss.rf_minn),
+        "rfj": "1" if ss.rf_rent else "0"})
+
+    if not ss.rf_sel:
+        st.info("위에서 지역(구)을 고르면 그 안의 동을 순위로 보여줍니다.")
+        st.stop()
+
+    trs, rts, info, fails = [], [], {}, []
+    prog = st.progress(0.0, text="실거래 불러오는 중")
+    rent_url = None
+    for i, name in enumerate(ss.rf_sel):
+        sd, g = name.split(" ", 1)
+        full = f"{SIDO_FULL[sd]} {g}"
+        ri = region_info(kakao_key, full)
+        if not ri:
+            fails.append(name)
+            continue
+        code, rlat, rlon = ri
+        info[name] = dict(full=full, lat=rlat, lon=rlon)
+        rows = []
+        for ym in recent_months(12):
+            try:
+                rows += fetch_month(data_key, code, ym)
+            except Exception:
+                pass
+        df_ = clean_trades(rows)
+        if not df_.empty:
+            df_["region"] = name
+            trs.append(df_)
+        if ss.rf_rent:
+            if rent_url is None:
+                rent_url, _ = find_rent_url(data_key, code, recent_months(1)[0])
+                rent_url = rent_url or ""
+            if rent_url:
+                rrows = []
+                for ym in recent_months(12):
+                    try:
+                        rrows += fetch_month(data_key, code, ym, rent_url)
+                    except Exception:
+                        pass
+                rd = clean_rents(rrows)
+                if not rd.empty:
+                    rd["region"] = name
+                    rts.append(rd)
+        prog.progress((i + 1) / len(ss.rf_sel), text=f"{name} 완료")
+    prog.empty()
+    if fails:
+        st.warning(f"지역 코드를 찾지 못했습니다: {', '.join(fails)}")
+    if ss.rf_rent and rent_url == "":
+        st.caption("전월세 API 승인이 확인되지 않아 전세가율은 빼고 계산했습니다.")
+    if not trs:
+        st.error("고른 지역의 빌라 실거래를 불러오지 못했습니다.")
+        st.stop()
+
+    T = pd.concat(trs, ignore_index=True)
+    T = T[T["price"].between(ss.rf_pmin, ss.rf_pmax) & T["area_py"].between(ss.rf_amin, ss.rf_amax)]
+    R = pd.concat(rts, ignore_index=True) if rts else pd.DataFrame()
+    if not R.empty:
+        R = R[R["area_py"].between(ss.rf_amin, ss.rf_amax)]
+    rk = rank_dongs(T, R, ss.rf_minn)
+    if rk.empty:
+        st.warning("조건에 맞는 동이 없습니다. 예산·평수 범위를 넓히거나 최소 거래 건수를 낮춰 보세요.")
+        st.stop()
+
+    def arrow(v, unit="%"):
+        return f"▲{v:.0f}{unit}" if v >= 5 else f"▼{abs(v):.0f}{unit}" if v <= -5 else "–"
+
+    st.write(f"조건: {won(ss.rf_pmin)}–{won(ss.rf_pmax)} · 전용 {ss.rf_amin}–{ss.rf_amax}평 · "
+             f"최근 12개월 · 동 **{len(rk)}곳**")
+    table = pd.DataFrame({
+        "순위": range(1, len(rk) + 1),
+        "지역": rk["region"], "동": rk["dong"], "점수": rk["score"].astype(int),
+        "거래": rk["n"], "거래 추세": rk["c_chg"].map(arrow),
+        "가격 추세": rk["p_chg"].map(lambda v: f"▲{v:.1f}%" if v >= 1 else f"▼{abs(v):.1f}%" if v <= -1 else "–"),
+        "중앙 매매가": rk["price"].map(won), "평단가(만)": rk["ppy"].round(0).fillna(0).astype(int),
+        "전세가율": rk["j_ratio"].map(lambda r: "-" if r is None or pd.isna(r) else f"{r * 100:.0f}%"),
+        "시세 안정": rk["cv"].map(lambda c: "높음" if c < 0.25 else "보통" if c < 0.45 else "낮음"),
+    })
+    st.dataframe(table, hide_index=True, use_container_width=True)
+
+    # 지도: 동 위치에 원 (크기 = 거래량, 색 = 거래 추세)
+    qs = [f"{info[r]['full']} {d}" for r, d in zip(rk["region"], rk["dong"])]
+    geo_d = geocode_many(kakao_key, qs)
+    rk["lat"] = [(geo_d.get(q) or [None])[0] for q in qs]
+    rk["lon"] = [(geo_d.get(q) or [None, None])[1] for q in qs]
+    mp = rk.dropna(subset=["lat", "lon"]).copy()
+    if len(mp):
+        import pydeck as pdk
+        mp["color"] = [[47, 158, 68, 190] if c >= 5 else [224, 49, 49, 170] if c <= -5 else [134, 142, 150, 170]
+                       for c in mp["c_chg"]]
+        mp["radius"] = (mp["n"] / mp["n"].max() * 600 + 150).astype(float)
+        mp["label"] = [f"{i + 1}위 {r} {d}\n점수 {sc:.0f} · 거래 {n}건\n평단가 {p:,.0f}만"
+                       for i, (r, d, sc, n, p) in enumerate(zip(mp["region"], mp["dong"], mp["score"],
+                                                                 mp["n"], mp["ppy"]))]
+        span = max(mp["lat"].max() - mp["lat"].min(), (mp["lon"].max() - mp["lon"].min()) * 0.8)
+        zoom = 13 if span < 0.03 else 12 if span < 0.07 else 11 if span < 0.15 else 10
+        st.pydeck_chart(pdk.Deck(
+            layers=[pdk.Layer("ScatterplotLayer", mp, get_position="[lon, lat]", get_fill_color="color",
+                              get_radius="radius", pickable=True, stroked=True, get_line_color=[255, 255, 255],
+                              line_width_min_pixels=1)],
+            initial_view_state=pdk.ViewState(latitude=mp["lat"].mean(), longitude=mp["lon"].mean(), zoom=zoom),
+            tooltip={"text": "{label}"}, map_style=LIGHT_MAP,
+            views=[pdk.View(type="MapView", controller=False)]), use_container_width=True)
+        st.caption("원 크기: 거래량 · 초록: 거래 늘어남 · 빨강: 거래 줄어듦 · 회색: 비슷함. 원을 누르면 정보가 보입니다.")
+
+    st.markdown("#### 이 동 분석하기")
+    pick = st.selectbox("동 선택", range(len(rk)),
+                        format_func=lambda i: f"{i + 1}위 · {rk['region'][i]} {rk['dong'][i]} (점수 {rk['score'][i]:.0f})")
+    st.button("이 동의 동네 프로필 보기 →", type="primary", use_container_width=True, on_click=_analyze_dong,
+              args=(info[rk["region"][pick]]["full"], rk["dong"][pick]))
+    st.caption("넘어가면 그 동에서 잘 팔리는 빌라 유형을 볼 수 있습니다. 실제 물건을 볼 때는 지번 주소를 넣어 다시 조회하세요.")
+    st.stop()
+
 
 auto = (not run and "trades" not in st.session_state and bool(qp.get("addr"))
         and bool(data_key) and bool(kakao_key))
@@ -1101,7 +1563,7 @@ if run or auto:
         st.session_state.pop("w_dong", None)
         st.query_params.pop("dong", None)
     st.session_state.update(trades=trades, lat0=lat0, lon0=lon0, addr=addr, b_code=b_code, t_jibun=t_jibun,
-                            sgg=" ".join(addr.split()[:-2]))
+                            sgg=sgg_of(addr))
     if run:
         # 시세 조회를 누르면 사이드 메뉴를 접어 결과 화면을 바로 보여줌
         # (매번 새로 실행되도록 시각값을 넣음)
@@ -1154,7 +1616,8 @@ dong_df = trades[trades["dong"] == dong]
 print_slot = st.container()
 
 report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None, "ck": None,
-          "calc": None, "rent": None, "loc": None, "weather": None, "food": None}
+          "calc": None, "rent": None, "loc": None, "weather": None, "food": None, "life": None, "slope": None, "land": None,
+          "aphus": None}
 
 with st.expander("📘 앱 전체 사용법"):
     st.markdown(GUIDE_ALL)
@@ -1200,6 +1663,23 @@ for _tb, _name in [(tab1, "동네 프로필"), (tab2, "비교사례"), (tab3, "�
     with _tb:
         with st.expander(f"📖 {_name} 탭 읽는 법"):
             st.markdown(GUIDES[_name])
+
+# 공동주택 공시가격: 여러 탭(전월세·건물·계산기)에서 쓰므로 먼저 계산
+aph = None
+_pnu = make_pnu(st.session_state.get("b_code", ""), st.session_state.get("t_jibun", ""))
+if vworld_key and _pnu:
+    _ap = fetch_aphus(vworld_key, vworld_domain, _pnu)
+    if isinstance(_ap, pd.DataFrame) and not _ap.empty:
+        aph = target_aphus(_ap, st.session_state.get("w_ho", ""), area_m2)
+        if len(aph["mine"]):
+            aph["price"] = aph["mine"]["price"].median()
+            aph["low"] = aph["mine"]["price"].min()
+            aph["high"] = aph["mine"]["price"].max()
+            aph["cap"] = aph["price"] * GUARANTEE_RATE
+        report["aphus"] = dict(year=aph["year"], how=aph["how"], price=aph.get("price"), low=aph.get("low"),
+                               high=aph.get("high"), cap=aph.get("cap"), n=len(aph["mine"]))
+    elif isinstance(_ap, str):
+        aph = {"error": _ap}
 
 # ── 동네 프로필
 with tab1:
@@ -1664,6 +2144,15 @@ with tab_rent:
                 else:
                     st.success("전세가율이 50–80%입니다. 안 팔리면 전세로 버티며 투자금 일부를 회수할 수 있는 구간입니다.")
             rent_rep.update(j_price=j_price, ratio=(j_price / sell if sell else None), left=left, nj=len(jeonse))
+            if aph and aph.get("cap"):
+                cap_m = aph["cap"] / 1e4
+                if j_price > cap_m:
+                    st.warning(f"전세보증보험 한도(공시가격 {won(aph['price'] / 1e4)} × 126% ≈ **{won(cap_m)}**)보다 "
+                               f"예상 전세가가 높습니다. 요즘 세입자는 보증보험이 되는 집을 찾으므로, "
+                               f"실제로는 {won(cap_m)} 이하로 전세를 놓아야 할 수 있습니다.")
+                else:
+                    st.success(f"예상 전세가가 전세보증보험 한도(≈ {won(cap_m)}) 안이라 세입자 구하기에 유리합니다.")
+                rent_rep.update(cap=cap_m)
         else:
             st.info("조건에 맞는 전세 거래가 없습니다. 반경이나 허용 범위를 넓혀 보세요.")
 
@@ -1782,6 +2271,169 @@ with tab4:
             {"ok": st.success, "warn": st.warning, "err": st.error, "info": st.info}[kind](msg)
         report["bld"] = bld
 
+# ── 지형·경사 (건물·입지 탭, 입지 위)
+with tab4:
+    st.markdown("#### 공시가격 (공동주택)")
+    if not vworld_key:
+        st.caption("브이월드 키를 넣으면 호실별 공시가격이 나옵니다.")
+    elif aph is None:
+        st.caption("지번을 확인할 수 없어 공시가격을 조회하지 못했습니다.")
+    elif "error" in aph:
+        st.caption(f"공시가격 조회 실패: {aph['error']}")
+    else:
+        if not len(aph["mine"]):
+            st.info(f"{aph['year']}년 공시가격에서 이 물건 호실을 찾지 못했습니다. 왼쪽 메뉴에 호수를 넣으면 정확히 찾습니다.")
+        else:
+            p = aph["price"]
+            rng_txt = "" if aph["low"] == aph["high"] else f" (후보 {won(aph['low'] / 1e4)}–{won(aph['high'] / 1e4)})"
+            hos = ", ".join(sorted({f"{h}호" for h in aph["mine"]["ho"]}))
+            a1, a2, a3 = st.columns(3)
+            a1.metric(f"{aph['year']}년 공시가격", won(p / 1e4))
+            a2.metric("1억 이하", "예" if p <= 1e8 else "아니오",
+                      help="공시가격 1억 이하 주택은 다주택 취득세 중과에서 빠집니다(정비구역 등 예외).")
+            a3.metric("전세보증보험 한도", won(aph["cap"] / 1e4), help="공시가격 × 140% × 90% ≈ 126%. 기준은 바뀔 수 있습니다.")
+            st.caption(f"{aph['how']}: {hos}{rng_txt}")
+            est_ = report.get("est") or {}
+            if est_.get("sell"):
+                st.caption(f"예상 매도가는 공시가격의 **{est_['sell'] * 1e4 / p * 100:.0f}%** 수준입니다. "
+                           "같은 동네 다른 빌라와 비교해 너무 높으면 예상 매도가를 다시 보세요.")
+            if p <= 1e8:
+                st.success("공시가격 1억 이하라 다주택자도 취득세 중과 없이 일반세율(1%대)로 살 수 있습니다. 계산기에 자동 반영했습니다.")
+            if len(aph["hist"]) >= 2:
+                hdf = aph["hist"].reset_index().rename(columns={"year": "연도", "price": "공시가격"})
+                hdf["공시가격(만)"] = (hdf["공시가격"] / 1e4).round(0)
+                st.altair_chart(alt.Chart(hdf).mark_line(point=True, color="#1C7ED6").encode(
+                    x=alt.X("연도:O", title=None), y=alt.Y("공시가격(만):Q", scale=alt.Scale(zero=False)),
+                    tooltip=["연도", "공시가격(만)"]).properties(height=180), use_container_width=True)
+                st.caption("이 호실의 연도별 공시가격 추이")
+        with st.expander(f"이 건물 전체 호실 공시가격 ({aph['year']}년)"):
+            lt = aph["latest"].sort_values("ho", key=lambda c: c.map(lambda h: (len(h), h)))
+            st.dataframe(pd.DataFrame({
+                "호": (lt["dong_nm"] + " " + lt["ho"] + "호").str.strip(), "전용(㎡)": lt["area"],
+                "공시가격": lt["price"].map(lambda v: won(v / 1e4))}), hide_index=True, use_container_width=True)
+
+    st.markdown("#### 지형·경사")
+    land = None
+    pnu = make_pnu(st.session_state.get("b_code", ""), st.session_state.get("t_jibun", ""))
+    if vworld_key and pnu:
+        land = fetch_land(vworld_key, vworld_domain, pnu)
+        if isinstance(land, str):
+            st.caption(f"브이월드 토지특성 조회 실패: {land}")
+            land = None
+    if land:
+        hg = land.get("tpgrphHgCodeNm", "-")
+        rs = land.get("roadSideCodeNm", "-")
+        price_m2 = to_num(land.get("pblntfPclnd"))
+        l1, l2, l3 = st.columns(3)
+        l1.metric("지형높이 (공식)", hg, help="개별공시지가 조사 때 필지마다 분류한 값: 저지·평지·완경사·급경사·고지")
+        l2.metric("도로 접면", rs, help=road_help(rs))
+        l3.metric("용도지역", land.get("prposArea1Nm", "-"))
+        l4, l5, l6 = st.columns(3)
+        l4.metric("공시지가", f"{price_m2 / 1e4:,.0f}만/㎡", f"평당 {price_m2 * PYEONG / 1e4:,.0f}만", delta_color="off")
+        l5.metric("대지면적", f"{to_num(land.get('lndpclAr')):,.1f}㎡")
+        l6.metric("지형 형상", land.get("tpgrphFrmCodeNm", "-"))
+        land_note = f"{land.get('stdrYear', '')}년 기준 · 이용상황 {land.get('ladUseSittnNm', '-')} · 도로: {road_help(rs)}"
+        # 세대당 대지지분 추정 (건축물대장 표제부의 대지면적 ÷ 세대수)
+        tl = expos_store().get(("title", st.session_state.get("b_code", ""), st.session_state.get("t_jibun", "")))
+        if isinstance(tl, list) and tl:
+            hh = max(to_num(tl[0].get("hhldCnt")), to_num(tl[0].get("hoCnt")))
+            if hh:
+                share = to_num(land.get("lndpclAr")) / hh
+                land_note += (f" · 세대당 대지지분 약 {share:.1f}㎡({share / PYEONG:.1f}평) → "
+                              f"공시지가 기준 땅값 약 {won(share * price_m2 / 1e4)}")
+        st.caption(land_note)
+        if any(k in hg for k in ("급경사", "고지")):
+            st.warning(f"공식 지형높이가 '{hg}'입니다. 노인·유모차 가구는 피할 수 있어 매수층이 좁아집니다.")
+        if "맹지" in rs:
+            st.error("길에 접하지 않은 땅(맹지)입니다. 재건축·대출에 불리할 수 있습니다.")
+        report["land"] = dict(hg=hg, rs=rs, zone=land.get("prposArea1Nm", "-"), price=price_m2,
+                              area=to_num(land.get("lndpclAr")), shape=land.get("tpgrphFrmCodeNm", "-"), note=land_note)
+    elif not vworld_key:
+        st.caption("브이월드 키를 넣으면 공식 지형높이·도로 접면·용도지역·공시지가도 함께 나옵니다.")
+    # 1) 주변 지형: 물건 둘레 8방향(150m·300m) 높이와 비교
+    ring_pts = [(lat0, lon0)] + [offset(lat0, lon0, d, b) for d in (150, 300) for b in range(0, 360, 45)]
+    el = fetch_elev(tuple(p[0] for p in ring_pts), tuple(p[1] for p in ring_pts))
+    slope_rep = {}
+    if not el:
+        st.info("높이 자료를 불러오지 못했습니다. 잠시 후 다시 열어 보세요.")
+    else:
+        h0, near, far = el[0], el[1:9], el[9:]
+        higher = sum(1 for h in near if h0 - h > 3)
+        lower = sum(1 for h in near if h - h0 > 3)
+        rng = max(el) - min(el)
+        if higher >= 6:
+            terrain = "언덕 위 (주변보다 높음)"
+        elif lower >= 6:
+            terrain = "낮은 곳 (주변보다 낮음 · 침수 이력 확인)"
+        elif rng < 8:
+            terrain = "평지"
+        else:
+            terrain = "경사지 (한쪽이 높고 한쪽이 낮음)"
+        steep_dir = max(range(8), key=lambda i: abs(near[i] - h0))
+        dirs = ["북", "북동", "동", "남동", "남", "남서", "서", "북서"]
+        t1, t2, t3 = st.columns(3)
+        t1.metric("물건 해발", f"{h0:.0f}m")
+        t2.metric("주변 지형", terrain.split(" (")[0])
+        t3.metric("반경 300m 높이차", f"{rng:.0f}m")
+        st.caption(f"{terrain}. 150m 안에서 높이 차이가 가장 큰 쪽은 **{dirs[steep_dir]}쪽**"
+                   f"({near[steep_dir] - h0:+.0f}m)입니다.")
+        slope_rep.update(h0=h0, terrain=terrain, rng=rng)
+
+    # 2) 역·정류장·학교 → 물건 경사 그래프
+    starts = {}
+    for label, params, _ in PLACES:
+        if label in ("지하철역", "버스정류장", "초등학교"):
+            p = nearest_place(kakao_key, round(lat0, 5), round(lon0, 5), json.dumps(params, ensure_ascii=False))
+            if p:
+                starts[label] = p
+    if starts:
+        if st.session_state.get("w_slp") not in starts:
+            st.session_state["w_slp"] = next(iter(starts))
+        st.radio("어디서 걸어올 때?", list(starts), key="w_slp", horizontal=True)
+        sp = starts[st.session_state.w_slp]
+        dist = haversine_m(sp["lat"], sp["lon"], lat0, lon0)
+        n = int(min(max(dist / 30, 5), 60))
+        pts = [(sp["lat"] + (lat0 - sp["lat"]) * i / n, sp["lon"] + (lon0 - sp["lon"]) * i / n) for i in range(n + 1)]
+        pe = fetch_elev(tuple(p[0] for p in pts), tuple(p[1] for p in pts))
+        if pe:
+            seg = dist / n
+            prof = pd.DataFrame({"거리(m)": [round(seg * i) for i in range(n + 1)], "해발(m)": pe})
+            grads = [(pe[i + 1] - pe[i]) / seg * 100 for i in range(n)]
+            # 지형 자료가 90m 간격이라 3칸씩 묶어 평균 경사를 봄
+            win = 3
+            smooth = [(pe[min(i + win, n)] - pe[i]) / (seg * (min(i + win, n) - i)) * 100 for i in range(n)]
+            prof["경사"] = ["가파름" if abs(g) >= 8 else "완만·평지" for g in smooth] + ["완만·평지"]
+            climb = pe[-1] - pe[0]
+            avg = climb / dist * 100 if dist else 0
+            steep_i = next((i for i, g in enumerate(smooth) if g >= 8), None)
+            g1, g2, g3 = st.columns(3)
+            g1.metric(f"{sp['name']}에서", f"{climb:+.0f}m", "오르막" if climb > 2 else "내리막" if climb < -2 else "거의 평지",
+                      delta_color="off")
+            g2.metric("평균 경사", f"{avg:+.1f}%", slope_label(avg), delta_color="off")
+            g3.metric("가장 가파른 구간", f"{max(smooth, key=abs):+.1f}%", slope_label(max(smooth, key=abs)),
+                      delta_color="off")
+            area = alt.Chart(prof).mark_area(opacity=0.25, color="#1C7ED6").encode(
+                x=alt.X("거리(m):Q", title=f"{sp['name']} → 경매 물건 (직선 {dist:,.0f}m)"),
+                y=alt.Y("해발(m):Q", scale=alt.Scale(zero=False)))
+            line = alt.Chart(prof).mark_line(color="#1C7ED6").encode(x="거리(m):Q", y="해발(m):Q")
+            dots = alt.Chart(prof).mark_circle(size=45).encode(
+                x="거리(m):Q", y="해발(m):Q",
+                color=alt.Color("경사:N", scale=alt.Scale(domain=["가파름", "완만·평지"],
+                                                       range=["#E03131", "#1C7ED6"]), legend=None),
+                tooltip=["거리(m)", "해발(m)", "경사"])
+            st.altair_chart((area + line + dots).properties(height=200), use_container_width=True)
+            if steep_i is not None:
+                st.caption(f"빨간 점부터 오르막이 가팔라집니다: 출발 후 약 {seg * steep_i:,.0f}m 지점부터. "
+                           "노인·유모차 가구에는 부담이 될 수 있습니다.")
+            else:
+                st.caption("큰 오르막 없이 걸어올 수 있는 길입니다(직선 기준).")
+            slope_rep.update(start=sp["name"], climb=climb, avg=avg,
+                             maxg=max(smooth, key=abs), steep_at=(seg * steep_i if steep_i is not None else None))
+    st.caption("경사 기준: 3% 미만 평지 · 3–8% 완만 · 8–12% 가파름 · 12% 이상 매우 가파름. "
+               "고도 자료가 약 90m 간격이고 직선으로 잰 값이라, 골목 계단·실제 길의 경사는 로드뷰로 꼭 확인하세요.")
+    report["slope"] = slope_rep or None
+
+
 # ── 입지 (건물·입지 탭 아래쪽)
 with tab4:
     st.markdown("#### 입지: 가까운 생활 시설")
@@ -1826,6 +2478,77 @@ with tab4:
                          fits=[f.replace("**", "") for f in fits])
 
 
+# ── 생활권 분석 (건물·입지 탭 맨 아래)
+with tab4:
+    st.markdown("#### 생활권: 주변 상가")
+    if st.session_state.get("w_sr") not in (300, 500, 1000):
+        st.session_state["w_sr"] = 500
+    sr = st.radio("반경", [300, 500, 1000], key="w_sr", horizontal=True, format_func=lambda v: f"{v}m")
+    with st.spinner("주변 상가 확인 중"):
+        sdf = stores_in_radius(data_key, round(lat0, 5), round(lon0, 5), sr)
+    if isinstance(sdf, str):
+        st.warning(f"{sdf}. 공공데이터포털 '소상공인시장진흥공단_상가(상권)정보' 승인 상태를 확인하세요.")
+    elif sdf.empty:
+        st.info("반경 안에 등록된 상가가 없습니다.")
+    else:
+        cnt = store_counts(sdf)
+        keys = ["학원", "병·의원", "약국", "음식점", "카페", "편의점", "슈퍼·마트"]
+        st.markdown(f"반경 {sr}m 안 점포 **{cnt['전체']:,}곳** · " +
+                    " · ".join(f"{k} **{cnt[k]}**" for k in keys))
+
+        # 상권 지도: 약 100m 칸으로 묶어 원 크기·색으로 밀집도 표시
+        g = sdf.assign(cy=(sdf["lat"] / 0.0009).round() * 0.0009, cx=(sdf["lon"] / 0.0011).round() * 0.0011)
+        cells = g.groupby(["cy", "cx"]).agg(n=("bizesNm", "size"),
+                                             top=("indsLclsNm", lambda x: x.value_counts().index[0])).reset_index()
+        cells = cells.rename(columns={"cy": "lat", "cx": "lon"})
+        mx = cells["n"].max()
+        cells["radius"] = (cells["n"] / mx * 55 + 8).astype(float)
+        cells["color"] = [[224, 49, 49, int(60 + 170 * n / mx)] for n in cells["n"]]
+        cells["label"] = [f"점포 {n}곳\n주요 업종: {t}" for n, t in zip(cells["n"], cells["top"])]
+        hub = cells.sort_values("n", ascending=False).iloc[0]
+        hub_m = haversine_m(lat0, lon0, hub["lat"], hub["lon"])
+        import pydeck as pdk
+        ring = pd.DataFrame({"lat": [lat0], "lon": [lon0], "label": ["경매 물건"]})
+        z = 16 if sr <= 300 else 15 if sr <= 500 else 14
+        st.pydeck_chart(pdk.Deck(
+            layers=[
+                pdk.Layer("ScatterplotLayer", ring, get_position="[lon, lat]", filled=False, stroked=True,
+                          get_line_color=[28, 126, 214], line_width_min_pixels=2, get_radius=sr),
+                pdk.Layer("ScatterplotLayer", cells, get_position="[lon, lat]", get_fill_color="color",
+                          get_radius="radius", pickable=True),
+                pdk.Layer("ScatterplotLayer", ring, get_position="[lon, lat]", filled=False, stroked=True,
+                          get_line_color=[20, 20, 20], line_width_min_pixels=3, get_radius=12,
+                          radius_min_pixels=8, pickable=True),
+            ],
+            initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=z),
+            tooltip={"text": "{label}"}, map_style=LIGHT_MAP,
+            views=[pdk.View(type="MapView", controller=False)]), use_container_width=True)
+        st.caption(f"빨간 원이 크고 진할수록 점포가 몰린 곳입니다. 파란 테두리는 반경 {sr}m, 검은 테두리가 경매 물건. "
+                   f"가장 밀집한 곳(상권 중심)까지 약 {hub_m:,.0f}m, 도보 약 {hub_m * WALK_FACTOR / WALK_M_PER_MIN:.0f}분.")
+
+        lc = sdf["indsLclsNm"].replace("", "기타").value_counts()
+        st.altair_chart(bin_chart(lc, None, height=200), use_container_width=True)
+        st.caption("업종 대분류별 점포 수")
+
+        k = (500 / sr) ** 2          # 반경이 달라도 비교할 수 있게 500m 기준으로 환산
+        life = []
+        if cnt["학원"] * k >= 15:
+            life.append(f"**학원가**: 학원 {cnt['학원']}곳 → 초·중등 자녀를 둔 3~4인 가구가 선호하는 동네입니다.")
+        if (cnt["병·의원"] + cnt["약국"]) * k >= 15:
+            life.append(f"**의료 편리**: 병·의원 {cnt['병·의원']}곳, 약국 {cnt['약국']}곳 → 노인 가구에 유리합니다.")
+        food_share = (cnt["음식점"] + cnt["카페"]) / max(cnt["전체"], 1)
+        if food_share >= 0.4 and cnt["편의점"] * k >= 5:
+            life.append("**1~2인 생활권**: 음식점·카페·편의점 비중이 높아 혼자 사는 직장인·청년이 살기 편합니다.")
+        if cnt["전체"] * k < 80:
+            life.append("**조용한 주거지**: 상가가 적어 조용하지만, 생활 편의시설까지 걸어야 할 수 있습니다.")
+        if hub_m <= 300:
+            life.append(f"**상권과 가까움**: 상권 중심까지 {hub_m:,.0f}m라 생활은 편하지만, 1층·저층은 소음을 확인하세요.")
+        for t in life:
+            st.markdown(f"- {t}")
+        st.caption(f"소상공인시장진흥공단 상가정보 기준(점포 등록 기준이라 실제와 조금 다를 수 있음).")
+        report["life"] = dict(radius=sr, cnt=cnt, hub_m=hub_m, notes=[t.replace("**", "") for t in life])
+
+
 # ── 임장 체크리스트
 with tab5:
     ss = st.session_state
@@ -1840,6 +2563,19 @@ with tab5:
         focus.append("동네 프로필과 맞지 않는 항목이 있습니다. 이 물건을 누구에게 팔지 현장에서 다시 따져 보세요.")
     if floor < 1:
         focus.append("지하·반지하 호실입니다. 습기·결로·곰팡이, 채광, 침수 이력을 꼭 확인하세요.")
+    ld = report.get("land") or {}
+    if any(k in ld.get("hg", "") for k in ("급경사", "고지")):
+        focus.append(f"공식 지형높이 '{ld['hg']}' 필지입니다. 집까지 오르막을 직접 걸어 보세요.")
+    if "맹지" in ld.get("rs", ""):
+        focus.append("맹지(길에 접하지 않은 땅)입니다. 진입로와 통행 권리를 확인하세요.")
+    sl = report.get("slope") or {}
+    if sl.get("maxg") is not None and abs(sl["maxg"]) >= 8:
+        focus.append(f"{sl['start']}에서 오는 길에 가파른 구간({sl['maxg']:+.0f}%)이 있습니다. "
+                     "직접 걸어 보고 노인·유모차 가구에 부담이 될지 확인하세요.")
+    if sl.get("terrain", "").startswith("언덕"):
+        focus.append("언덕 위 물건입니다. 겨울 빙판길, 차량 진입, 마을버스 노선을 확인하세요.")
+    if sl.get("terrain", "").startswith("낮은"):
+        focus.append("주변보다 낮은 곳입니다. 침수 이력과 반지하·1층 습기를 꼭 확인하세요.")
     if age >= 30:
         focus.append(f"{age}년 된 건물입니다. 누수 흔적, 배관 교체 여부, 외벽 균열을 집중해서 보세요.")
     if focus:
@@ -1875,7 +2611,8 @@ with tab6:
         "c_kind": "경매 수익", "c_amt": max(0, int(r_est.get("sell", 10000))), "c_dep": 5000, "c_rent": 50,
         "c_deal": "매매", "c_rate": 0.0, "c_vat": False, "c_ptype": "주택",
         "c_price": max(0, int(r_est.get("bid", min_bid) or min_bid)), "c_houses": 1, "c_adj": False,
-        "c_over85": area_m2 > 85, "c_corp": False, "c_low": False,
+        "c_over85": area_m2 > 85, "c_corp": False,
+        "c_low": bool(aph and aph.get("price") and aph["price"] <= 1e8),
         "c_loan": 0, "c_irate": 4.5, "c_months": 6, "c_method": "원리금균등",
         "c_bid": max(0, int(r_est.get("bid", min_bid) or min_bid)),
         "c_sell": max(0, int(r_est.get("sell", min_bid * 1.4))),
@@ -2161,6 +2898,44 @@ def build_report_html() -> str:
         for f in lc["fits"]:
             parts.append(f"<div class='box'>{e(f)}</div>")
 
+    ap_ = report.get("aphus")
+    if ap_ and ap_.get("price"):
+        parts.append(f"<h2>공시가격 ({ap_['year']}년)</h2><table>"
+                     f"<tr><th>공시가격</th><td>{won(ap_['price'] / 1e4)}</td><th>1억 이하</th>"
+                     f"<td>{'예 (취득세 중과 제외)' if ap_['price'] <= 1e8 else '아니오'}</td></tr>"
+                     f"<tr><th>전세보증보험 한도</th><td>{won(ap_['cap'] / 1e4)}</td><th>기준</th><td>{e(ap_['how'])}</td></tr>"
+                     f"</table>")
+
+    ld_ = report.get("land")
+    if ld_:
+        parts.append(f"<h2>토지 정보 (공식)</h2><table>"
+                     f"<tr><th>지형높이</th><td>{e(ld_['hg'])}</td><th>도로 접면</th><td>{e(ld_['rs'])}</td></tr>"
+                     f"<tr><th>용도지역</th><td>{e(ld_['zone'])}</td><th>공시지가</th>"
+                     f"<td>{ld_['price'] / 1e4:,.0f}만/㎡ (평당 {ld_['price'] * PYEONG / 1e4:,.0f}만)</td></tr>"
+                     f"<tr><th>대지면적</th><td>{ld_['area']:,.1f}㎡</td><th>지형 형상</th><td>{e(ld_['shape'])}</td></tr>"
+                     f"</table><div class='box'>{e(ld_['note'])}</div>")
+
+    sp_ = report.get("slope")
+    if sp_:
+        parts.append("<h2>지형·경사</h2><table>")
+        if sp_.get("h0") is not None:
+            parts.append(f"<tr><th>물건 해발</th><td>{sp_['h0']:.0f}m</td><th>주변 지형</th><td>{e(sp_['terrain'])}</td></tr>")
+        if sp_.get("start"):
+            stp = f"출발 후 약 {sp_['steep_at']:,.0f}m부터 가파름" if sp_.get("steep_at") is not None else "큰 오르막 없음"
+            parts.append(f"<tr><th>{e(sp_['start'])}에서</th><td>{sp_['climb']:+.0f}m (평균 {sp_['avg']:+.1f}%)</td>"
+                         f"<th>가장 가파른 구간</th><td>{sp_['maxg']:+.1f}% · {e(stp)}</td></tr>")
+        parts.append("</table>")
+
+    lf = report.get("life")
+    if lf:
+        c = lf["cnt"]
+        parts.append(f"<h2>생활권 (반경 {lf['radius']}m 상가)</h2><table><tr>" +
+                     "".join(f"<th>{e(k)}</th>" for k in c) + "</tr><tr>" +
+                     "".join(f"<td class='num'>{v:,}</td>" for v in c.values()) + "</tr></table>")
+        parts.append(f"<div class='box'>상권 중심까지 약 {lf['hub_m']:,.0f}m</div>")
+        for n_ in lf["notes"]:
+            parts.append(f"<div class='box'>{e(n_)}</div>")
+
     cl = report.get("calc")
     if cl:
         parts.append(f"""<h2>경매 수익 계산 (어림)</h2><table>
@@ -2266,7 +3041,7 @@ st.query_params.update({
     "it": "1" if ss.get("w_it", True) else "0", "bk": "1" if ss.get("w_bk", True) else "0",
     "stn": str(ss.get("w_stn", 0)), "mv": "1" if ss.get("w_mv") else "0",
     "fk": ss.get("w_fk", "음식점"), "fb": ss.get("w_fb", "경매 물건 주변"),
-    "tab": ss.get("w_tab") or ss.get("_last_tab", "동네 프로필"),
+    "tab": ss.get("w_tab") or ss.get("_last_tab", "동네 프로필"), "mode": "물건 분석", "sr": str(ss.get("w_sr", 500)), "slp": ss.get("w_slp", "지하철역"),
     "rp": str(ss.get("w_rp", 500)), "ex": str(ss.get("w_ex", 400)), "pf": str(ss.get("w_pf", 2500)),
     **({"ppy": str(ss["w_ppy"])} if "w_ppy" in ss else {}),
 })
