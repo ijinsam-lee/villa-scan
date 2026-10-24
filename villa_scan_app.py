@@ -937,6 +937,7 @@ for k, v in {
     "w_mv": qp.get("mv", "0") == "1",
     "w_fk": qp.get("fk", "음식점"),
     "w_fb": qp.get("fb", "경매 물건 주변"),
+    "w_tab": qp.get("tab", "동네 프로필"),
     "sel_cur": set(filter(None, qp.get("sel", "").split(","))),
     "ck_done": set(filter(None, qp.get("ck", "").split(","))),
 }.items():
@@ -953,8 +954,7 @@ def reset_all():
 
 # 리셋 직후: 브라우저에 기억한 탭 위치도 지움
 if st.session_state.pop("_reset", False):
-    components.html("<script>try{localStorage.removeItem('villa_tab');window.parent.__villaRestored=false;}catch(e){}</script>",
-                    height=0)
+    pass
 
 
 with st.sidebar:
@@ -1078,38 +1078,46 @@ dong = st.selectbox("동네", dongs, key="w_dong")
 dong_df = trades[trades["dong"] == dong]
 print_slot = st.container()
 
-# 마지막으로 보던 탭을 기억했다가 새로고침 후 다시 열어 줌
-components.html("""<script>
-(function () {
-  const KEY = 'villa_tab';
-  let doc; try { doc = window.parent.document; } catch (e) { return; }
-  function setup(tries) {
-    const tabs = [...doc.querySelectorAll('button[role="tab"]')];
-    if (!tabs.length) { if (tries < 40) setTimeout(() => setup(tries + 1), 150); return; }
-    tabs.forEach(t => { if (!t.dataset.vs) { t.dataset.vs = 1;
-      t.addEventListener('click', () => localStorage.setItem(KEY, t.innerText.trim())); } });
-    if (!window.parent.__villaRestored) {
-      window.parent.__villaRestored = true;
-      const want = localStorage.getItem(KEY);
-      const b = tabs.find(t => t.innerText.trim() === want);
-      if (b && b.getAttribute('aria-selected') !== 'true') b.click();
-    }
-  }
-  setup(0);
-  // 화면이 다시 그려져 탭 버튼이 새로 생겨도 클릭을 계속 기억하도록
-  setInterval(() => { [...doc.querySelectorAll('button[role="tab"]')].forEach(t => {
-    if (!t.dataset.vs) { t.dataset.vs = 1;
-      t.addEventListener('click', () => localStorage.setItem(KEY, t.innerText.trim())); } }); }, 1000);
-})();
-</script>""", height=0)
 report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None, "ck": None,
           "calc": None, "rent": None, "loc": None, "weather": None, "food": None}
 
 with st.expander("📘 앱 전체 사용법"):
     st.markdown(GUIDE_ALL)
 
-tab1, tab2, tab3, tab_rent, tab4, tab5, tab6 = st.tabs(
-    ["동네 프로필", "비교사례", "예상 매도가", "전월세", "건물·입지", "임장 체크", "계산기"])
+SECTIONS = ["동네 프로필", "비교사례", "예상 매도가", "전월세", "건물·입지", "임장 체크", "계산기"]
+if st.session_state.get("w_tab") not in SECTIONS:
+    st.session_state["w_tab"] = SECTIONS[0]
+st.session_state.setdefault("_last_tab", st.session_state["w_tab"])
+
+
+def _keep_tab():
+    # 선택된 메뉴를 다시 눌러 선택이 풀리면 직전 메뉴로 되돌림
+    ss_ = st.session_state
+    if ss_.get("w_tab") not in SECTIONS:
+        ss_["w_tab"] = ss_.get("_last_tab", SECTIONS[0])
+    ss_["_last_tab"] = ss_["w_tab"]
+
+
+# 메뉴: 선택값을 주소창에 저장하므로 새로고침·다른 앱 다녀와도 같은 화면으로 돌아옴
+with st.container(key="nav_menu"):
+    if hasattr(st, "segmented_control"):
+        st.segmented_control("메뉴", SECTIONS, key="w_tab", on_change=_keep_tab,
+                             label_visibility="collapsed")
+    else:
+        st.radio("메뉴", SECTIONS, key="w_tab", horizontal=True, label_visibility="collapsed")
+cur_tab = st.session_state.get("w_tab") or st.session_state.get("_last_tab", SECTIONS[0])
+
+# 모든 화면을 계산은 하되(인쇄 보고서용), 고른 화면만 보이게 함
+tab1, tab2, tab3, tab_rent, tab4, tab5, tab6 = [st.container(key=f"sec_{i}") for i in range(len(SECTIONS))]
+_hide = ", ".join(f".st-key-sec_{i}" for i, n in enumerate(SECTIONS) if n != cur_tab)
+st.markdown("<style>" + _hide + " { display: none !important; }"
+            ".st-key-nav_menu { background:#e7f0fb; border:1px solid #c5daf3; border-radius:12px; padding:8px; }"
+            ".st-key-nav_menu button { font-weight:600; }"
+            ".st-key-nav_menu button[data-testid*='Active'], .st-key-nav_menu button[kind*='Active'] "
+            "{ background:#1C7ED6 !important; color:#fff !important; border-color:#1C7ED6 !important; }"
+            ".st-key-nav_menu button[data-testid*='Active'] *, .st-key-nav_menu button[kind*='Active'] * "
+            "{ color:#fff !important; }"
+            "</style>", unsafe_allow_html=True)
 
 # 각 탭 맨 위에 '읽는 법' 접힘 메뉴
 for _tb, _name in [(tab1, "동네 프로필"), (tab2, "비교사례"), (tab3, "예상 매도가"), (tab_rent, "전월세"),
@@ -1386,8 +1394,9 @@ with tab2:
             map_style=LIGHT_MAP,  # 컴퓨터가 다크 모드여도 항상 밝은 지도
         )
         with map_slot:
-            st.markdown(f"경매 물건: [카카오맵에서 보기]({kakao_map_link('경매 물건', lat0, lon0)}) · "
-                        f"[로드뷰]({kakao_roadview_link(lat0, lon0)})")
+            st.markdown(f"경매 물건: <a href='{kakao_map_link('경매 물건', lat0, lon0)}' target='_blank' "
+                        f"rel='noopener'>카카오맵에서 보기</a> · <a href='{kakao_roadview_link(lat0, lon0)}' "
+                        f"target='_blank' rel='noopener'>로드뷰</a> (새 창)", unsafe_allow_html=True)
             move = st.toggle("지도 움직이기 (확대·이동)", key="w_mv",
                              help="끄면 지도 위에서 손가락으로 화면을 스크롤할 수 있습니다.")
             deck.views = [pdk.View(type="MapView", controller=True if move else False)]
@@ -1980,15 +1989,23 @@ def build_report_html() -> str:
     parts = [f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <title>빌라 시세조사 - {e(st.session_state.addr)}</title>
 <style>
-  @page {{ size: A4; margin: 14mm; }}
-  body {{ font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; color: #222; font-size: 12px; }}
-  h1 {{ font-size: 20px; margin: 0 0 4px; }} h2 {{ font-size: 15px; margin: 18px 0 6px; border-bottom: 2px solid #333; padding-bottom: 3px; }}
-  .muted {{ color: #666; }} .box {{ background: #f4f6f8; padding: 8px 10px; border-radius: 4px; margin: 6px 0; }}
-  .warn {{ background: #fff4e5; }}
-  table {{ border-collapse: collapse; width: 100%; }} th, td {{ border: 1px solid #bbb; padding: 4px 6px; text-align: left; }}
-  th {{ background: #eceff3; }} td.num {{ text-align: right; }} tr {{ page-break-inside: avoid; }}
+  @page {{ size: A4; margin: 12mm; }}
+  /* 오래된 프린터에서도 잘 보이도록: 검정 글자, 굵게, 크게, 굵은 선, 회색 배경 없음 */
+  * {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+  body {{ font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; color: #000;
+         font-size: 14px; font-weight: 700; line-height: 1.45; }}
+  h1 {{ font-size: 24px; font-weight: 900; margin: 0 0 4px; }}
+  h2 {{ font-size: 18px; font-weight: 900; margin: 20px 0 6px; border-bottom: 3px solid #000; padding-bottom: 3px; }}
+  b {{ font-weight: 900; }}
+  .muted {{ color: #000; }}
+  .box {{ background: #fff; border: 2px solid #000; padding: 8px 10px; border-radius: 4px; margin: 6px 0; }}
+  .warn {{ border-width: 3px; border-style: double; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1.5px solid #000; padding: 5px 6px; text-align: left; color: #000; }}
+  th {{ background: #fff; font-weight: 900; }}
+  td.num {{ text-align: right; }} tr {{ page-break-inside: avoid; }}
   .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }}
-  .grid div {{ border: 1px solid #ccc; padding: 6px; border-radius: 4px; }} .grid b {{ display: block; font-size: 15px; }}
+  .grid div {{ border: 2px solid #000; padding: 6px; border-radius: 4px; }} .grid b {{ display: block; font-size: 17px; }}
 </style></head><body>
 <h1>빌라 시세조사</h1>
 <div class="muted">{today} 출력 · 최근 {months}개월 국토부 실거래가 기준</div>
@@ -2176,6 +2193,7 @@ st.query_params.update({
     "it": "1" if ss.get("w_it", True) else "0", "bk": "1" if ss.get("w_bk", True) else "0",
     "stn": str(ss.get("w_stn", 0)), "mv": "1" if ss.get("w_mv") else "0",
     "fk": ss.get("w_fk", "음식점"), "fb": ss.get("w_fb", "경매 물건 주변"),
+    "tab": ss.get("w_tab") or ss.get("_last_tab", "동네 프로필"),
     "rp": str(ss.get("w_rp", 500)), "ex": str(ss.get("w_ex", 400)), "pf": str(ss.get("w_pf", 2500)),
     **({"ppy": str(ss["w_ppy"])} if "w_ppy" in ss else {}),
 })
