@@ -575,19 +575,30 @@ st.markdown("""<style>
 html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"], [data-testid="stMain"], section.main {
   overscroll-behavior-y: contain;
 }
-/* 탭 메뉴 강조: 색 배경 + 버튼 모양, 휴대폰에서도 모든 탭이 보이도록 줄바꿈 */
-div[data-baseweb="tab-list"] {
-  flex-wrap: wrap; gap: 6px; padding: 8px; border-radius: 12px;
-  background: #e7f0fb; border: 1px solid #c5daf3;
+/* 탭 메뉴 강조: 색 배경 + 버튼 모양, 휴대폰에서도 모든 탭이 보이도록 줄바꿈
+   (스트림릿 버전마다 구조가 달라 여러 이름으로 지정) */
+[data-testid="stTabs"] [role="tablist"], div[data-baseweb="tab-list"] {
+  flex-wrap: wrap !important; gap: 6px !important; padding: 8px !important;
+  border-radius: 12px !important; background: #e7f0fb !important; border: 1px solid #c5daf3 !important;
+  overflow: visible !important;
 }
-button[data-baseweb="tab"] {
-  padding: 6px 14px !important; margin: 0 !important; height: auto !important;
-  border-radius: 999px; background: #ffffff; border: 1px solid #c5daf3;
+[data-testid="stTabs"] [role="tablist"] > div:has(> button[role="tab"]) { display: contents; }
+[data-testid="stTabs"] button[role="tab"], button[data-baseweb="tab"] {
+  padding: 6px 14px !important; margin: 0 !important; height: auto !important; flex: 0 0 auto !important;
+  border-radius: 999px !important; background: #ffffff !important; border: 1px solid #c5daf3 !important;
 }
-button[data-baseweb="tab"] p { color: #1c4f8a; font-weight: 600; font-size: 15px; }
-button[data-baseweb="tab"][aria-selected="true"] { background: #1C7ED6; border-color: #1C7ED6; }
-button[data-baseweb="tab"][aria-selected="true"] p { color: #ffffff; }
-div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display: none; }
+[data-testid="stTabs"] button[role="tab"] *, button[data-baseweb="tab"] * {
+  color: #1c4f8a !important; font-weight: 600 !important;
+}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"], button[data-baseweb="tab"][aria-selected="true"] {
+  background: #1C7ED6 !important; border-color: #1C7ED6 !important;
+}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] *,
+button[data-baseweb="tab"][aria-selected="true"] * { color: #ffffff !important; }
+[data-testid="stTabs"] [data-baseweb="tab-highlight"], [data-testid="stTabs"] [data-baseweb="tab-border"],
+div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display: none !important; }
+/* 탭 줄 오른쪽의 '>' 스크롤 화살표 숨김 (줄바꿈으로 모두 보이므로) */
+[data-testid="stTabs"] [role="tablist"] ~ button, [data-testid="stTabs"] button[aria-label*="scroll" i] { display: none !important; }
 </style>""", unsafe_allow_html=True)
 
 # 조회 조건을 주소창(URL)에 저장 → 새로고침돼도 같은 조건으로 자동 재조회
