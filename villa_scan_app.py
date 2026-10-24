@@ -1181,8 +1181,9 @@ KAKAO_MAP_TEMPLATE = r"""
 <style>
   html,body{margin:0;padding:0;font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif}
   #wrap{position:relative;width:100%;height:__H__px;border-radius:10px;overflow:hidden;border:1px solid #dde3ea}
-  #map,#rv{position:absolute;inset:0}
-  #rv{display:none;z-index:5;background:#000}
+  #map{position:absolute;top:0;left:0;width:100%;height:100%}
+  #rvbox{position:absolute;top:0;left:0;width:100%;height:100%;display:none;z-index:5;background:#000}
+  #rv{width:100%;height:100%}
   .ctl{position:absolute;z-index:6;padding:6px 10px;border-radius:8px;border:1px solid #c5daf3;background:#fff;
        font-size:13px;font-weight:600;color:#1c4f8a;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.15)}
   #mv{left:8px;top:8px} #back{left:8px;top:8px;display:none}
@@ -1194,11 +1195,11 @@ KAKAO_MAP_TEMPLATE = r"""
   .info{background:#fff;border:1px solid #c9d2dc;border-radius:10px;padding:8px 10px;font-size:12.5px;line-height:1.45;
         max-width:240px;box-shadow:0 2px 8px rgba(0,0,0,.2);color:#222;white-space:normal}
   .info b{font-size:13.5px} .info .btns{margin-top:6px;display:flex;gap:6px}
-  .info button{flex:1;padding:4px 0;border-radius:6px;border:1px solid #1C7ED6;background:#1C7ED6;color:#fff;font-size:12px}
+  .info button{flex:1;white-space:nowrap;min-width:56px;padding:4px 0;border-radius:6px;border:1px solid #1C7ED6;background:#1C7ED6;color:#fff;font-size:12px}
   .info button.x{background:#fff;color:#1C7ED6}
   #err{display:none;padding:12px;color:#c92a2a;font-size:13px}
 </style>
-<div id="wrap"><div id="map"></div><div id="rv"></div>
+<div id="wrap"><div id="map"></div><div id="rvbox"><div id="rv"></div></div>
   <button class="ctl" id="mv"></button><button class="ctl" id="back">← 지도로 돌아가기</button></div>
 <div id="err"></div>
 <script>
@@ -1227,22 +1228,29 @@ function start(){ kakao.maps.load(function(){
   function setMove(v){movable=v;map.setDraggable(v);map.setZoomable(v);
     mvb.textContent=v?'🔓 지도 움직이기 켜짐':'🔒 지도 고정 (누르면 움직이기)';}
   setMove(movable); mvb.onclick=()=>setMove(!movable);
-  const rvEl=document.getElementById('rv'), back=document.getElementById('back');
-  const rv=new kakao.maps.Roadview(rvEl), rvc=new kakao.maps.RoadviewClient();
+  const rvBox=document.getElementById('rvbox'), back=document.getElementById('back');
+  const rvc=new kakao.maps.RoadviewClient(); let rv=null;
   function openRV(lat,lon){const p=LL(lat,lon);
     rvc.getNearestPanoId(p,80,function(id){
       if(id===null){alert('근처 80m 안에 로드뷰가 없습니다.');return;}
-      rvEl.style.display='block';back.style.display='block';mvb.style.display='none';
-      rv.setPanoId(id,p);setTimeout(()=>rv.relayout(),60);});}
-  back.onclick=()=>{rvEl.style.display='none';back.style.display='none';mvb.style.display='block';map.relayout();};
+      if(info)info.setMap(null);
+      rvBox.style.display='block';back.style.display='block';mvb.style.display='none';
+      // 로드뷰는 보이는 상태에서 만들어야 크기를 제대로 잡음
+      setTimeout(()=>{ if(!rv)rv=new kakao.maps.Roadview(document.getElementById('rv'));
+        rv.setPanoId(id,p); rv.relayout(); },30);});}
+  back.onclick=()=>{rvBox.style.display='none';back.style.display='none';mvb.style.display='block';map.relayout();};
   let info=null;
   function showInfo(pt){
     if(info)info.setMap(null);
     const box=document.createElement('div');box.className='info';
     box.innerHTML='<b>'+esc(pt.title)+'</b><br>'+esc(pt.label).replace(/\n/g,'<br>');
     const btns=document.createElement('div');btns.className='btns';
-    const b1=document.createElement('button');b1.textContent='로드뷰';b1.onclick=()=>openRV(pt.lat,pt.lon);
-    const b2=document.createElement('button');b2.className='x';b2.textContent='닫기';b2.onclick=()=>{info.setMap(null);};
+    const b1=document.createElement('button');b1.textContent='로드뷰';
+    b1.onclick=(ev)=>{ev.stopPropagation();openRV(pt.lat,pt.lon);};
+    const b2=document.createElement('button');b2.className='x';b2.textContent='닫기';
+    b2.onclick=(ev)=>{ev.stopPropagation();info.setMap(null);};
+    box.addEventListener('mousedown',ev=>ev.stopPropagation());
+    box.addEventListener('touchstart',ev=>ev.stopPropagation());
     btns.appendChild(b1);btns.appendChild(b2);box.appendChild(btns);
     info=new kakao.maps.CustomOverlay({position:LL(pt.lat,pt.lon),content:box,yAnchor:1.12,zIndex:20});
     info.setMap(map);}
@@ -1974,7 +1982,7 @@ with tab2:
             disabled=[c for c in ed_df.columns if c != "임장"],
             column_config={"임장": st.column_config.CheckboxColumn("임장", width="small")})
         # 건물별 카카오맵·로드뷰 (같은 창으로 열려 '뒤로가기'로 바로 돌아옴)
-        with st.expander("🗺 건물별 카카오맵 · 로드뷰", expanded=True):
+        with st.expander("🗺 건물별 카카오맵 · 로드뷰 (새 탭으로 열기)", expanded=not secret("KAKAO_JS_KEY")):
             blds = comps.drop_duplicates("q")
             st.markdown(html_table([
                 {"건물": n, "거리": f"{d:.0f}m", "지도": "", "로드뷰": "",
@@ -2093,8 +2101,9 @@ with tab2:
             map_style=LIGHT_MAP,  # 컴퓨터가 다크 모드여도 항상 밝은 지도
         )
         with map_slot:
-            st.markdown(f"경매 물건: {link_html(kakao_map_link('경매 물건', lat0, lon0), '카카오맵에서 보기')} · "
-                        f"{link_html(kakao_roadview_link(lat0, lon0), '로드뷰')}", unsafe_allow_html=True)
+            if not secret("KAKAO_JS_KEY"):
+                st.markdown(f"경매 물건: {link_html(kakao_map_link('경매 물건', lat0, lon0), '카카오맵에서 보기')} · "
+                            f"{link_html(kakao_roadview_link(lat0, lon0), '로드뷰')}", unsafe_allow_html=True)
             kjs = secret("KAKAO_JS_KEY")
             if kjs:
                 # 카카오맵: 건물명·상가가 보이고, 점을 누르면 정보창 → '로드뷰'로 앱 안에서 바로 확인
