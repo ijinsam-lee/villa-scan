@@ -7,6 +7,7 @@
 필요한 키 (.streamlit/secrets.toml 또는 사이드바 입력)
   DATA_GO_KR_KEY = "공공데이터포털 일반 인증키(Decoding)"
   KAKAO_REST_KEY = "카카오 디벨로퍼스 REST API 키"
+  TMAP_APP_KEY   = "SK open API TMAP 앱키 (선택: 임장 동선을 실제 도보 경로로)"
 
 공공데이터포털에서 '국토교통부_연립다세대 매매 실거래가 자료' 활용신청 필요
 실행: pip install streamlit pandas requests  →  streamlit run villa_scan_app.py
@@ -509,6 +510,76 @@ def walk_m(a: dict, b: dict) -> float:
     return haversine_m(a["lat"], a["lon"], b["lat"], b["lon"]) * WALK_FACTOR
 
 
+TMAP_WALK_URL = "https://apis.openapi.sk.com/tmap/routes/pedestrian?version=1"
+
+
+class TmapError(Exception):
+    pass
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def tmap_walk(app_key: str, a_lat: float, a_lon: float, b_lat: float, b_lon: float):
+    """TMAP 보행자 경로 한 구간 → (거리 m, 시간 분, [[lat, lon], ...])
+    무료 사용량이 하루 정해져 있어 같은 구간은 일주일 동안 다시 묻지 않음.
+    실패는 예외로 던져 캐시에 남지 않게 함(다음에 다시 시도)"""
+    if haversine_m(a_lat, a_lon, b_lat, b_lon) < 15:  # 같은 자리 → 걸을 필요 없음
+        return 0.0, 0.0, [[a_lat, a_lon], [b_lat, b_lon]]
+    try:
+        r = requests.post(TMAP_WALK_URL, timeout=10,
+                          headers={"appKey": app_key.strip(), "Accept": "application/json"},
+                          json={"startX": a_lon, "startY": a_lat, "endX": b_lon, "endY": b_lat,
+                                "startName": "%EC%B6%9C%EB%B0%9C", "endName": "%EB%8F%84%EC%B0%A9",
+                                "reqCoordType": "WGS84GEO", "resCoordType": "WGS84GEO"})
+        js = r.json()
+    except Exception as ex:
+        raise TmapError(f"연결 실패 ({type(ex).__name__})")
+    feats = js.get("features") or []
+    if not feats:
+        err = js.get("error") or {}
+        raise TmapError(err.get("message") or err.get("code") or f"HTTP {r.status_code}")
+    prop = feats[0].get("properties", {})
+    dist, sec = prop.get("totalDistance"), prop.get("totalTime")
+    if dist is None or sec is None:
+        raise TmapError("응답에 거리·시간이 없음")
+    path = []
+    for f in feats:
+        g = f.get("geometry") or {}
+        if g.get("type") == "LineString":
+            for lon, lat in g.get("coordinates", []):
+                if not path or path[-1] != [lat, lon]:
+                    path.append([lat, lon])
+    if len(path) < 2:
+        path = [[a_lat, a_lon], [b_lat, b_lon]]
+    return float(dist), float(sec) / 60, path
+
+
+def walk_legs(app_key: str, pts: list[dict]) -> tuple[list[dict], str]:
+    """방문 순서대로 구간별 실제 도보 경로. 키가 없거나 실패한 구간은 직선×1.3 추정
+    → (구간 목록, 실패 사유)"""
+    pairs = list(zip(pts, pts[1:]))
+    res, errs = [None] * len(pairs), []
+    if app_key:
+        def one(ab):
+            a, b = ab
+            try:
+                return tmap_walk(app_key, round(a["lat"], 6), round(a["lon"], 6),
+                                 round(b["lat"], 6), round(b["lon"], 6))
+            except TmapError as ex:
+                errs.append(str(ex))
+                return None
+        # 캐시 함수(st.cache_data)는 화면 실행 흐름 안에서 부르는 게 안전해 차례로 호출 (구간 수 ≤ 10 안팎)
+        res = [one(ab) for ab in pairs]
+    legs = []
+    for (a, b), got in zip(pairs, res):
+        if got:
+            legs.append(dict(m=got[0], min=got[1], path=got[2], real=True))
+        else:
+            m = walk_m(a, b)
+            legs.append(dict(m=m, min=m / WALK_M_PER_MIN,
+                             path=[[a["lat"], a["lon"]], [b["lat"], b["lon"]]], real=False))
+    return legs, (errs[0] if errs else "")
+
+
 def plan_route(start: dict, stops: list[dict], back: bool) -> list[dict]:
     """출발역에서 모든 건물을 가장 짧게 도는 순서 (8곳 이하는 전수 탐색)"""
     from itertools import permutations
@@ -802,7 +873,7 @@ GUIDES = {
 - **층**도 봅니다. 같은 건물이라도 지하·1층·고층은 가격이 다릅니다. 이 물건과 같은 층이 팔린 적이 있는지 확인합니다.
 - **카카오맵·로드뷰** 링크로 건물 외관, 골목 경사, 주차를 미리 봅니다.
 
-**임장 동선**: '임장' 칸을 체크하면 가까운 지하철역에서 출발하는 최단 방문 순서를 짜 줍니다. 비교 임장은 2–3곳이 적당합니다.
+**임장 동선**: '임장' 칸을 체크하면 가까운 지하철역에서 출발하는 최단 방문 순서를 짜 줍니다. TMAP 키가 있으면 거리·시간과 지도 선이 실제 걷는 길 기준입니다. 비교 임장은 2–3곳이 적당합니다.
 """,
 "예상 매도가": """
 **왜 보나요?** 입찰가는 **예상 매도가에서 거꾸로** 계산합니다.
@@ -2022,7 +2093,7 @@ with tab2:
                                   "label": [f"경매 물건\n{st.session_state.addr}"]})
 
         # ── 임장 동선
-        route, station = [], None
+        route, station, route_path = [], None, []
         if sel_qs:
             st.markdown("#### 임장 동선")
             r1, r2 = st.columns(2)
@@ -2049,21 +2120,38 @@ with tab2:
             route = plan_route(station, stops, back)
 
             pts = [station] + route + ([station] if back else [])
-            legs = [walk_m(a, b) for a, b in zip(pts, pts[1:])]
-            total_m = sum(legs)
-            total_min = total_m / WALK_M_PER_MIN + STAY_MIN * len(route)
-            st.write(f"걷는 거리 약 **{total_m / 1000:.1f}km** · 이동 {total_m / WALK_M_PER_MIN:.0f}분 + "
-                     f"확인 {STAY_MIN}분×{len(route)}곳 = 총 **{int(total_min // 60)}시간 {total_min % 60:.0f}분** 예상")
+            tmap_key = secret("TMAP_APP_KEY")
+            from contextlib import nullcontext
+            with (st.spinner("도보 경로 찾는 중…") if tmap_key else nullcontext()):
+                legs, tmap_err = walk_legs(tmap_key, pts)
+            n_real = sum(lg["real"] for lg in legs)
+            total_m = sum(lg["m"] for lg in legs)
+            move_min = sum(lg["min"] for lg in legs)
+            total_min = move_min + STAY_MIN * len(route)
+            st.write(f"걷는 거리 {'' if n_real == len(legs) else '약 '}**{total_m / 1000:.1f}km** · "
+                     f"이동 {move_min:.0f}분 + 확인 {STAY_MIN}분×{len(route)}곳 = "
+                     f"총 **{int(total_min // 60)}시간 {total_min % 60:.0f}분** 예상")
             from html import escape as _esc
             lines = [f"🚇 <b>출발</b> {_esc(station['name'])}"]
-            for i, (a, b, m) in enumerate(zip(pts, pts[1:], legs), start=1):
+            for i, (a, b, lg) in enumerate(zip(pts, pts[1:], legs), start=1):
                 to = f"<b>{i}. {_esc(b['name'])}</b>" if i <= len(route) else f"🚇 <b>도착</b> {_esc(b['name'])}"
-                lines.append(f"{to} — 도보 약 {m / WALK_M_PER_MIN:.0f}분 ({m:,.0f}m) · "
+                lines.append(f"{to} — 도보 {'' if lg['real'] else '약 '}{lg['min']:.0f}분 ({lg['m']:,.0f}m) · "
                              f"{link_html(kakao_route_link(a, b), '길찾기')}")
             st.markdown("<div style='line-height:1.9'>" + "<br>".join(lines) + "</div>", unsafe_allow_html=True)
-            st.caption("거리는 직선거리에 1.3배를 곱한 추정치입니다. 길찾기를 누르면 카카오맵에서 실제 경로가 열립니다.")
+            if n_real == len(legs):
+                st.caption("TMAP 보행자 길찾기로 계산한 실제 도보 경로입니다(지도 초록 선). "
+                           "방문 순서는 직선거리 기준으로 짰습니다.")
+            elif tmap_key:
+                st.caption(f"TMAP 도보 경로를 {len(legs) - n_real}구간 못 받아와('{tmap_err}') 그 구간은 "
+                           "직선거리×1.3 추정치입니다. '약'이 붙은 구간이 추정입니다.")
+            else:
+                st.caption("거리는 직선거리에 1.3배를 곱한 추정치입니다. 길찾기를 누르면 카카오맵에서 실제 경로가 열립니다. "
+                           "(secrets에 TMAP_APP_KEY를 넣으면 실제 도보 경로로 바뀝니다)")
             report["route"] = dict(station=station["name"], back=back, total_m=total_m, total_min=total_min,
-                                   rows=[(i, b["name"], m) for i, (b, m) in enumerate(zip(pts[1:], legs), start=1)])
+                                   real=n_real == len(legs),
+                                   rows=[(i, b["name"], lg["m"], lg["min"])
+                                         for i, (b, lg) in enumerate(zip(pts[1:], legs), start=1)])
+            route_path = [p for k, lg in enumerate(legs) for p in (lg["path"] if k == 0 else lg["path"][1:])]
 
         import pydeck as pdk
         layers = [
@@ -2080,7 +2168,7 @@ with tab2:
         if route:
             path_pts = [station] + route + ([station] if back else [])
             layers.insert(0, pdk.Layer(
-                "PathLayer", pd.DataFrame({"path": [[[p["lon"], p["lat"]] for p in path_pts]]}),
+                "PathLayer", pd.DataFrame({"path": [[[lon, lat] for lat, lon in route_path]]}),
                 get_path="path", get_color=[47, 158, 68, 200], width_min_pixels=4))
             nums = pd.DataFrame([dict(lat=p["lat"], lon=p["lon"], t=str(i)) for i, p in enumerate(route, 1)])
             layers.append(pdk.Layer("TextLayer", nums, get_position="[lon, lat]", get_text="t",
@@ -2090,7 +2178,7 @@ with tab2:
             layers.append(pdk.Layer("ScatterplotLayer", st_df, get_position="[lon, lat]",
                                     get_fill_color=[47, 158, 68], get_radius=20,
                                     radius_min_pixels=9, radius_max_pixels=14, pickable=True))
-            lats = [p["lat"] for p in path_pts]; lons = [p["lon"] for p in path_pts]
+            lats = [p[0] for p in route_path]; lons = [p[1] for p in route_path]
             view_lat, view_lon = (max(lats) + min(lats)) / 2, (max(lons) + min(lons)) / 2
             span = max(max(lats) - min(lats), (max(lons) - min(lons)) * 0.8)
             zoom = 16 if span < 0.004 else 15 if span < 0.009 else 14 if span < 0.018 else 13
@@ -2117,7 +2205,7 @@ with tab2:
                     "movable": bool(st.session_state.get("w_mv", False)), "fit": True,
                 }
                 if route:
-                    kdata["route"] = [[p["lat"], p["lon"]] for p in path_pts]
+                    kdata["route"] = route_path
                     kdata["stops"] = [{"lat": p["lat"], "lon": p["lon"], "num": i} for i, p in enumerate(route, 1)]
                     kdata["station"] = {"lat": station["lat"], "lon": station["lon"], "title": "출발역",
                                         "label": station["name"]}
@@ -3129,11 +3217,15 @@ def build_report_html() -> str:
     if rt:
         parts.append(f"<h2>임장 동선 · {e(rt['station'])} 출발</h2><table><tr><th>순서</th><th>방문지</th>"
                      f"<th>도보</th><th>확인</th></tr>")
-        for i, name, m in rt["rows"]:
+        approx = "" if rt.get("real") else "약 "
+        for row in rt["rows"]:
+            i, name, m = row[:3]
+            mins = row[3] if len(row) > 3 else m / WALK_M_PER_MIN
             last = rt["back"] and i == len(rt["rows"])
             parts.append(f"<tr><td class='num'>{'도착' if last else i}</td><td>{e(name)}</td>"
-                         f"<td class='num'>약 {m / WALK_M_PER_MIN:.0f}분 ({m:,.0f}m)</td><td>☐</td></tr>")
-        parts.append(f"</table><div class='box'>걷는 거리 약 {rt['total_m'] / 1000:.1f}km · "
+                         f"<td class='num'>{approx}{mins:.0f}분 ({m:,.0f}m)</td><td>☐</td></tr>")
+        parts.append(f"</table><div class='box'>걷는 거리 {approx}{rt['total_m'] / 1000:.1f}km"
+                     f"{' (TMAP 도보 경로)' if rt.get('real') else ''} · "
                      f"확인 시간 포함 약 {int(rt['total_min'] // 60)}시간 {rt['total_min'] % 60:.0f}분</div>")
 
     show = report.get("comps")
