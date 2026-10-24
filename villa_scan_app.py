@@ -536,6 +536,35 @@ def plan_route(start: dict, stops: list[dict], back: bool) -> list[dict]:
     return [stops[i] for i in best]
 
 
+def link_html(url: str, text: str) -> str:
+    """같은 창(앱 전체 화면)에서 열리는 링크. 휴대폰 '뒤로가기'로 앱에 돌아오면 보던 화면이 복원됨"""
+    from html import escape
+    return f"<a href='{escape(url, quote=True)}' target='_top'>{escape(text)}</a>" if url else ""
+
+
+def html_table(rows: list[dict], links: dict | None = None) -> str:
+    """링크를 넣을 수 있는 간단한 표. links = {열이름: (url 키, 표시 글자)}"""
+    from html import escape
+    links = links or {}
+    if not rows:
+        return ""
+    cols = [c for c in rows[0] if not c.startswith("_")]
+    head = "".join(f"<th>{escape(c)}</th>" for c in cols)
+    body = ""
+    for r in rows:
+        cells = []
+        for c in cols:
+            if c in links:
+                cells.append(f"<td>{link_html(r.get(links[c][0]) or '', links[c][1])}</td>")
+            else:
+                cells.append(f"<td>{escape(str(r.get(c, '')))}</td>")
+        body += "<tr>" + "".join(cells) + "</tr>"
+    return ("<div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;font-size:14px'>"
+            "<style>.vt th,.vt td{border-bottom:1px solid #e3e6ea;padding:6px 8px;text-align:left;white-space:nowrap}"
+            ".vt th{background:#f3f6fa}.vt a{font-weight:600}</style>"
+            f"<thead class='vt'><tr>{head}</tr></thead><tbody class='vt'>{body}</tbody></table></div>")
+
+
 def kakao_map_link(name: str, lat: float, lon: float) -> str:
     from urllib.parse import quote
     name = "".join(ch for ch in str(name) if ch not in ",/")
@@ -952,6 +981,43 @@ def reset_all():
     st.session_state["_reset"] = True
 
 
+# ── 최근 본 물건: 홈 화면 아이콘처럼 주소가 고정된 링크로 열어도 이어서 볼 수 있게 서버에 기록
+RECENT_FILE = "recent_views.json"
+
+
+@st.cache_resource
+def recent_store() -> dict:
+    try:
+        with open(RECENT_FILE, encoding="utf-8") as f:
+            return {"items": json.load(f)}
+    except Exception:
+        return {"items": []}
+
+
+def push_recent(params: dict):
+    store = recent_store()
+    addr = params.get("addr", "")
+    if not addr:
+        return
+    items = [it for it in store["items"] if it["params"].get("addr") != addr]
+    old = next((it for it in store["items"] if it["params"].get("addr") == addr), None)
+    if old and old["params"] == params:
+        return  # 바뀐 게 없으면 저장 안 함
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")
+    store["items"] = ([{"params": params, "time": now}] + items)[:8]
+    try:
+        with open(RECENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(store["items"], f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def open_recent(params: dict):
+    st.session_state.clear()
+    st.query_params.from_dict(params)
+
+
 # 리셋 직후: 브라우저에 기억한 탭 위치도 지움
 if st.session_state.pop("_reset", False):
     pass
@@ -1057,6 +1123,14 @@ if run or auto:
 </script>""", height=0)
 
 if "trades" not in st.session_state:
+    recents = recent_store()["items"]
+    if recents:
+        st.markdown("#### 최근 본 물건 이어서 보기")
+        for n, it in enumerate(recents):
+            p = it["params"]
+            label = f"📍 {p.get('addr', '')}  ·  {p.get('tab', '동네 프로필')}  ·  {it['time']}"
+            st.button(label, key=f"recent_{n}", on_click=open_recent, args=(p,), use_container_width=True)
+        st.caption("누르면 그때의 입력값, 체크한 임장지, 보던 메뉴까지 그대로 열립니다.")
     st.info("왼쪽에 경매 물건 정보를 입력하고 시세 조회를 누르세요. (휴대폰은 왼쪽 위 >> 버튼)")
     with st.expander("📘 앱 전체 사용법 (처음이면 읽어 보세요)", expanded=True):
         st.markdown(GUIDE_ALL)
@@ -1273,18 +1347,19 @@ with tab2:
         ed_df = show.rename(columns={"name": "건물명", "ho": "동·호", "jibun": "지번",
                                      "build_year": "건축년도", "floor": "층"})
         ed_df.insert(0, "임장", init)
-        pos = list(ed_df.columns).index("동·호") + 1
-        ed_df.insert(pos, "지도", [kakao_map_link(n, a, o) for n, a, o in
-                                   zip(comps["name"], comps["lat"], comps["lon"])])
-        ed_df.insert(pos + 1, "로드뷰", [kakao_roadview_link(a, o) for a, o in zip(comps["lat"], comps["lon"])])
         edited = st.data_editor(
             ed_df, key=ed_key, hide_index=True, use_container_width=True,
             disabled=[c for c in ed_df.columns if c != "임장"],
-            column_config={
-                "임장": st.column_config.CheckboxColumn("임장", width="small"),
-                "지도": st.column_config.LinkColumn("지도", display_text="카카오맵", width="small"),
-                "로드뷰": st.column_config.LinkColumn("로드뷰", display_text="보기", width="small"),
-            })
+            column_config={"임장": st.column_config.CheckboxColumn("임장", width="small")})
+        # 건물별 카카오맵·로드뷰 (같은 창으로 열려 '뒤로가기'로 바로 돌아옴)
+        with st.expander("🗺 건물별 카카오맵 · 로드뷰", expanded=True):
+            blds = comps.drop_duplicates("q")
+            st.markdown(html_table([
+                {"건물": n, "거리": f"{d:.0f}m", "지도": "", "로드뷰": "",
+                 "_map": kakao_map_link(n, a_, o_), "_rv": kakao_roadview_link(a_, o_)}
+                for n, d, a_, o_ in zip(blds["name"], blds["dist_m"], blds["lat"], blds["lon"])],
+                links={"지도": ("_map", "카카오맵"), "로드뷰": ("_rv", "보기")}), unsafe_allow_html=True)
+            st.caption("링크는 같은 창에서 열립니다. 다 본 뒤 휴대폰 '뒤로가기'를 누르면 이 화면으로 돌아옵니다.")
         sel_rows = [i for i, v in enumerate(edited["임장"].tolist()) if v]
         st.session_state.sel_cur = {ids[i] for i in sel_rows}
         sel_qs = list(dict.fromkeys(comps.loc[sel_rows, "q"]))  # 같은 건물 여러 거래는 한 곳으로
@@ -1347,12 +1422,13 @@ with tab2:
             total_min = total_m / WALK_M_PER_MIN + STAY_MIN * len(route)
             st.write(f"걷는 거리 약 **{total_m / 1000:.1f}km** · 이동 {total_m / WALK_M_PER_MIN:.0f}분 + "
                      f"확인 {STAY_MIN}분×{len(route)}곳 = 총 **{int(total_min // 60)}시간 {total_min % 60:.0f}분** 예상")
-            lines = [f"🚇 **출발** {station['name']}"]
+            from html import escape as _esc
+            lines = [f"🚇 <b>출발</b> {_esc(station['name'])}"]
             for i, (a, b, m) in enumerate(zip(pts, pts[1:], legs), start=1):
-                to = f"**{i}. {b['name']}**" if i <= len(route) else f"🚇 **도착** {b['name']}"
+                to = f"<b>{i}. {_esc(b['name'])}</b>" if i <= len(route) else f"🚇 <b>도착</b> {_esc(b['name'])}"
                 lines.append(f"{to} — 도보 약 {m / WALK_M_PER_MIN:.0f}분 ({m:,.0f}m) · "
-                             f"[길찾기]({kakao_route_link(a, b)})")
-            st.markdown("  \n".join(lines))
+                             f"{link_html(kakao_route_link(a, b), '길찾기')}")
+            st.markdown("<div style='line-height:1.9'>" + "<br>".join(lines) + "</div>", unsafe_allow_html=True)
             st.caption("거리는 직선거리에 1.3배를 곱한 추정치입니다. 길찾기를 누르면 카카오맵에서 실제 경로가 열립니다.")
             report["route"] = dict(station=station["name"], back=back, total_m=total_m, total_min=total_min,
                                    rows=[(i, b["name"], m) for i, (b, m) in enumerate(zip(pts[1:], legs), start=1)])
@@ -1394,9 +1470,8 @@ with tab2:
             map_style=LIGHT_MAP,  # 컴퓨터가 다크 모드여도 항상 밝은 지도
         )
         with map_slot:
-            st.markdown(f"경매 물건: <a href='{kakao_map_link('경매 물건', lat0, lon0)}' target='_blank' "
-                        f"rel='noopener'>카카오맵에서 보기</a> · <a href='{kakao_roadview_link(lat0, lon0)}' "
-                        f"target='_blank' rel='noopener'>로드뷰</a> (새 창)", unsafe_allow_html=True)
+            st.markdown(f"경매 물건: {link_html(kakao_map_link('경매 물건', lat0, lon0), '카카오맵에서 보기')} · "
+                        f"{link_html(kakao_roadview_link(lat0, lon0), '로드뷰')}", unsafe_allow_html=True)
             move = st.toggle("지도 움직이기 (확대·이동)", key="w_mv",
                              help="끄면 지도 위에서 손가락으로 화면을 스크롤할 수 있습니다.")
             deck.views = [pdk.View(type="MapView", controller=True if move else False)]
@@ -1453,21 +1528,17 @@ with tab2:
     foods = nearby_food(kakao_key, round(flat, 4), round(flon, 4), st.session_state.w_fk)
     if foods:
         foods = sorted(foods, key=lambda f: f["dist"])
-        fdf = pd.DataFrame([dict(이름=f["name"], 종류=f["cat"],
-                                 거리=f"{f['dist']:,}m", 도보=f"약 {f['dist'] * WALK_FACTOR / WALK_M_PER_MIN:.0f}분",
-                                 지도=kakao_map_link(f["name"], f["lat"], f["lon"]) if f.get("lat") else None,
-                                 길찾기=kakao_route_link(dict(name="경매 물건" if st.session_state.w_fb == "경매 물건 주변"
-                                                             else st.session_state.w_fb, lat=flat, lon=flon),
-                                                        dict(name=f["name"], lat=f["lat"], lon=f["lon"]))
-                                 if f.get("lat") else None,
-                                 전화=f["phone"], 카카오맵=f["url"]) for f in foods])
-        st.dataframe(fdf, hide_index=True, use_container_width=True,
-                     column_order=["이름", "지도", "길찾기", "종류", "거리", "도보", "카카오맵", "전화"],
-                     column_config={
-                         "지도": st.column_config.LinkColumn("지도", display_text="위치 보기", width="small"),
-                         "길찾기": st.column_config.LinkColumn("길찾기", display_text="가는 길", width="small"),
-                         "카카오맵": st.column_config.LinkColumn("후기·별점", display_text="보기", width="small"),
-                     })
+        base_pt = dict(name="경매 물건" if st.session_state.w_fb == "경매 물건 주변" else st.session_state.w_fb,
+                       lat=flat, lon=flon)
+        food_rows = [{
+            "이름": f["name"], "지도": "", "길찾기": "", "종류": f["cat"], "거리": f"{f['dist']:,}m",
+            "도보": f"약 {f['dist'] * WALK_FACTOR / WALK_M_PER_MIN:.0f}분", "후기": "", "전화": f["phone"],
+            "_map": kakao_map_link(f["name"], f["lat"], f["lon"]) if f.get("lat") else "",
+            "_route": (kakao_route_link(base_pt, dict(name=f["name"], lat=f["lat"], lon=f["lon"]))
+                       if f.get("lat") else ""),
+            "_url": f["url"]} for f in foods]
+        st.markdown(html_table(food_rows, links={"지도": ("_map", "위치 보기"), "길찾기": ("_route", "가는 길"),
+                                                 "후기": ("_url", "별점·후기")}), unsafe_allow_html=True)
         st.caption("카카오맵 '맛집' 검색에 잡힌 곳만 가까운 순으로 보여줍니다. 별점과 후기는 '보기'를 눌러 확인하세요.")
         report["food"] = dict(base=st.session_state.w_fb, kind=st.session_state.w_fk, rows=foods[:10])
     else:
@@ -1725,8 +1796,8 @@ with tab4:
                 rows_loc.append(dict(시설=label, 이름="2km 안에 없음", 거리="-", 도보="-", 매수층=who,
                                      지도=None, _min=None))
     loc_df = pd.DataFrame(rows_loc)
-    st.dataframe(loc_df.drop(columns=["_min"]), hide_index=True, use_container_width=True,
-                 column_config={"지도": st.column_config.LinkColumn("지도", display_text="보기", width="small")})
+    st.markdown(html_table([{**{k: v for k, v in r.items() if k != "지도"}, "지도": "", "_url": r["지도"]}
+                            for r in rows_loc], links={"지도": ("_url", "보기")}), unsafe_allow_html=True)
     mins = {r["시설"]: r["_min"] for r in rows_loc}
 
     def near(k, m):
@@ -2197,3 +2268,4 @@ st.query_params.update({
     "rp": str(ss.get("w_rp", 500)), "ex": str(ss.get("w_ex", 400)), "pf": str(ss.get("w_pf", 2500)),
     **({"ppy": str(ss["w_ppy"])} if "w_ppy" in ss else {}),
 })
+push_recent({k: st.query_params.get(k) for k in st.query_params.keys()})
