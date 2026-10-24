@@ -47,6 +47,10 @@ TAG_MAP = {
     "floor": "floor", "층": "floor",
     "cdealType": "cancel", "해제여부": "cancel",
     "dealingGbn": "deal_type", "거래유형": "deal_type",
+    "deposit": "deposit", "보증금액": "deposit",
+    "monthlyRent": "rent", "월세금액": "rent",
+    "contractType": "ctype", "계약구분": "ctype",
+    "contractTerm": "term", "계약기간": "term",
 }
 
 
@@ -54,6 +58,9 @@ TAG_MAP = {
 
 def parse_rt_xml(text: str) -> list[dict]:
     root = ET.fromstring(text)
+    auth = root.findtext(".//returnAuthMsg")
+    if auth:
+        raise RuntimeError(auth)
     code = root.findtext(".//resultCode")
     if code not in (None, "00", "000"):
         raise RuntimeError(f"실거래 API 오류: {code} {root.findtext('.//resultMsg')}")
@@ -69,10 +76,10 @@ def parse_rt_xml(text: str) -> list[dict]:
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def fetch_month(service_key: str, lawd_cd: str, ymd: str) -> list[dict]:
+def fetch_month(service_key: str, lawd_cd: str, ymd: str, url: str = RT_URL) -> list[dict]:
     rows, page = [], 1
     while True:
-        r = requests.get(RT_URL, params={
+        r = requests.get(url, params={
             "serviceKey": service_key, "LAWD_CD": lawd_cd, "DEAL_YMD": ymd,
             "pageNo": page, "numOfRows": 1000,
         }, timeout=20)
@@ -184,11 +191,11 @@ def haversine_m(lat1, lon1, lat2, lon2):
 # ───────────────────────── 분석 ─────────────────────────
 
 PRICE_BINS = [0, 5000, 10000, 15000, 20000, 30000, 1e9]
-PRICE_LABELS = ["5천 미만", "5천~1억", "1억~1.5억", "1.5억~2억", "2억~3억", "3억 이상"]
+PRICE_LABELS = ["5천 미만", "5천–1억", "1억–1.5억", "1.5억–2억", "2억–3억", "3억 이상"]
 AREA_BINS = [0, 10, 15, 20, 25, 1e9]
-AREA_LABELS = ["10평 미만", "10~15평", "15~20평", "20~25평", "25평 이상"]
+AREA_LABELS = ["10평 미만", "10–15평", "15–20평", "20–25평", "25평 이상"]
 AGE_BINS = [-1, 5, 12, 20, 30, 1e9]
-AGE_LABELS = ["5년 이하", "6~12년", "13~20년", "21~30년", "30년 초과"]
+AGE_LABELS = ["5년 이하", "6–12년", "13–20년", "21–30년", "30년 초과"]
 FLOOR_BINS = [-10, 0, 1, 2, 3, 4, 100]
 FLOOR_LABELS = ["지하", "1층", "2층", "3층", "4층", "5층 이상"]
 
@@ -334,6 +341,86 @@ def guess_ho(units, floor, area_m2) -> str:
     return names[0] if len(names) == 1 else " / ".join(names[:3]) + (" 등" if len(names) > 3 else "") + "?"
 
 
+# ───────────────────────── 전월세 · 입지 ─────────────────────────
+
+RENT_URLS = [  # 포털 버전에 따라 주소 끝에 2가 붙기도 해서 차례로 시도
+    "https://apis.data.go.kr/1613000/RTMSDataSvcRHRent/getRTMSDataSvcRHRent",
+    "https://apis.data.go.kr/1613000/RTMSDataSvcRHRent2/getRTMSDataSvcRHRent2",
+]
+
+
+def find_rent_url(service_key: str, lawd_cd: str, ymd: str):
+    """작동하는 전월세 API 주소를 찾음 → (주소, 오류문구)"""
+    last = ""
+    for url in RENT_URLS:
+        try:
+            fetch_month(service_key, lawd_cd, ymd, url)
+            return url, ""
+        except PermissionError:
+            last = "403 접근 거부(활용신청 필요)"
+        except Exception as e:
+            last = str(e).split(" for url")[0]
+    return None, last
+
+
+def clean_rents(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    for c in ["jibun", "name", "dong", "ctype", "rent", "deposit", "floor", "build_year"]:
+        if c not in df:
+            df[c] = ""
+    df["deposit"] = pd.to_numeric(df["deposit"].astype(str).str.replace(",", ""), errors="coerce")
+    df["rent"] = pd.to_numeric(df["rent"].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
+    for c in ["area_m2", "build_year", "floor", "year", "month", "day"]:
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    df = df.dropna(subset=["deposit", "area_m2"])
+    df["area_py"] = df["area_m2"] / PYEONG
+    df["age"] = date.today().year - df["build_year"]
+    df["deal_date"] = pd.to_datetime(dict(year=df["year"], month=df["month"], day=df["day"]), errors="coerce")
+    df["jibun"] = df["jibun"].fillna("").astype(str).str.strip()
+    df["ctype"] = df["ctype"].fillna("").astype(str).str.strip()
+    df["kind"] = ["전세" if r == 0 else "월세" for r in df["rent"]]
+    df["dep_ppy"] = df["deposit"] / df["area_py"]
+    return df.reset_index(drop=True)
+
+
+# 입지: 카카오 장소 검색 (카테고리 코드 또는 키워드)
+PLACES = [
+    ("초등학교", dict(query="초등학교", category_group_code="SC4"), "3–4인 가구"),
+    ("중학교", dict(query="중학교", category_group_code="SC4"), "3–4인 가구"),
+    ("어린이집·유치원", dict(category_group_code="PS3"), "신혼·영유아 가구"),
+    ("지하철역", dict(category_group_code="SW8"), "1–2인 직장인"),
+    ("버스정류장", dict(query="버스정류장"), "전 가구"),
+    ("대형마트", dict(category_group_code="MT1"), "3–4인 가구"),
+    ("편의점", dict(category_group_code="CS2"), "1–2인 가구"),
+    ("병원", dict(category_group_code="HP8"), "노인 가구"),
+    ("약국", dict(category_group_code="PM9"), "노인 가구"),
+    ("공원", dict(query="공원"), "영유아·노인 가구"),
+]
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
+def nearest_place(kakao_key: str, lat: float, lon: float, params_json: str, radius: int = 2000):
+    params = json.loads(params_json)
+    url = ("https://dapi.kakao.com/v2/local/search/keyword.json" if "query" in params
+           else "https://dapi.kakao.com/v2/local/search/category.json")
+    try:
+        r = requests.get(url, params={**params, "x": lon, "y": lat, "radius": radius,
+                                      "sort": "distance", "size": 5},
+                         headers={"Authorization": f"KakaoAK {kakao_key.strip()}"}, timeout=10)
+        docs = r.json().get("documents", [])
+    except Exception:
+        return None
+    q = params.get("query", "")
+    for d in docs:   # 키워드 검색은 '초등학교 앞 문구점' 같은 결과가 섞여 이름으로 한 번 더 거름
+        name = d.get("place_name", "")
+        if q in ("초등학교", "중학교") and not name.endswith(q):
+            continue
+        return dict(name=name, lat=float(d["y"]), lon=float(d["x"]), dist=int(d.get("distance") or 0))
+    return None
+
+
 # ───────────────────────── 임장 동선 ─────────────────────────
 
 WALK_FACTOR = 1.3      # 직선거리 → 실제 걸음거리 보정
@@ -414,7 +501,7 @@ CHECKLIST = [
         ("p3", "건물 정보 탭: 근생 호실·주차·엘리베이터 확인, 정부24 건축물대장으로 위반건축물 표시 확인"),
         ("p4", "예상 매도가를 집에서 먼저 정하기 (부동산에 \"얼마에 팔려요?\"부터 묻지 않기)"),
         ("p5", "로드뷰로 골목 경사, 계단, 주차 공간, 주변 건물 상태 미리 보기"),
-        ("p6", "비교사례 중 임장할 곳을 체크해 동선 짜기 (비교 평가 2~3곳)"),
+        ("p6", "비교사례 중 임장할 곳을 체크해 동선 짜기 (비교 평가 2–3곳)"),
     ]),
     ("건물 외부", [
         ("o1", "외벽 균열, 하얀 백화 자국(누수 흔적), 보수 공사 흔적"),
@@ -434,7 +521,7 @@ CHECKLIST = [
     ("동네와 수요 (누구에게 팔까)", [
         ("n1", "평형이 이 동네 매수층(가구원 수)과 맞는지"),
         ("n2", "초등학교, 마트, 버스·지하철까지 실제로 걸어 보기"),
-        ("n3", "같은 골목 비교 매물 2~3곳과 외관·층·주차 비교"),
+        ("n3", "같은 골목 비교 매물 2–3곳과 외관·층·주차 비교"),
         ("n4", "주변 신축 공급(경쟁 매물)과 재개발·모아타운 등 이슈"),
     ]),
     ("부동산 방문 (선택)", [
@@ -457,7 +544,7 @@ KEY_NOTES = """
 - **경매 낙찰자 매물이 많은 동네는 조심한다.** 낙찰자끼리 급매 경쟁을 하게 되고, 이건 내가 바꿀 수 없는 변수입니다.
 - **매물 소화 기간은 바꿀 수 있다.** 더 싸게 받고 수리를 잘하면 내 물건 순서를 앞당길 수 있습니다.
 - **평단가 편차가 크면 업계약을 의심한다.** 예상 매도가 탭의 경고를 보고 이상치는 빼고 판단합니다.
-- **세후 수익은 역산한다.** 매매사업자 6~15% 구간 기준 대략 차익 2,500만 → 세후 1천만, 4,000만 → 2천만, 5,000만 → 3천만 정도입니다(강의 기준 어림값, 실제 세율로 다시 계산).
+- **세후 수익은 역산한다.** 매매사업자 6–15% 구간 기준 대략 차익 2,500만 → 세후 1천만, 4,000만 → 2천만, 5,000만 → 3천만 정도입니다(강의 기준 어림값, 실제 세율로 다시 계산).
 - **처음엔 작게 한 사이클을 완주한다.** 낙찰 → 명도 → 수리 → 매도까지 세후 1천만 원 목표로 경험을 쌓습니다.
 """
 
@@ -500,7 +587,7 @@ def acq_tax(price: float, houses_after: int, adjusted: bool, over85: bool,
     elif corp:
         rate, why = 12.0, "법인 취득 중과"
     elif houses_after <= 1 or (houses_after == 2 and not adjusted):
-        rate, why = basic(), "일반세율(1~3%)"
+        rate, why = basic(), "일반세율(1–3%)"
     elif adjusted:
         rate, why = (8.0, "조정대상지역 2주택 중과") if houses_after == 2 else (12.0, "조정대상지역 3주택 이상 중과")
     else:
@@ -539,6 +626,159 @@ def loan_schedule(principal: float, annual_rate: float, months: int, method: str
         return dict(first=principal / months + principal * r, total_interest=interest)
     pay = principal / months if r == 0 else principal * r / (1 - (1 + r) ** -months)
     return dict(first=pay, total_interest=pay * months - principal)
+
+
+def auction_profit(bid_w, sell_w, extra_w, loan_w, irate, months, houses, adj, over85, low, taxmode) -> dict:
+    """낙찰가 하나에 대한 세전·세후 수익 (모두 원 단위)"""
+    t = acq_tax(bid_w, houses, adj, over85, False, low)
+    sale_fee = brokerage_fee(sell_w, FEE_SALE)[0] * 1.1          # 부가세 포함
+    interest = loan_w * irate / 100 / 12 * months
+    costs = t["total"] + extra_w + sale_fee + interest
+    gap = sell_w - bid_w
+    pre = gap - costs
+    if taxmode.startswith("매매사업자"):
+        tax = progressive_tax(pre) * 1.1                          # 지방소득세 10% 포함
+        note = "다른 소득이 없다고 보고 종합소득세 기본세율(6–45%)과 지방소득세를 적용"
+    else:
+        base = max(pre + interest - 2.5e6, 0)                     # 양도세는 대출이자를 필요경비로 인정 안 함
+        if months < 12:
+            tax, note = base * 0.70 * 1.1, "1년 미만 보유 주택 70% + 지방세"
+        elif months < 24:
+            tax, note = base * 0.60 * 1.1, "2년 미만 보유 주택 60% + 지방세"
+        else:
+            tax, note = progressive_tax(base) * 1.1, "2년 이상 보유, 기본세율 + 지방세"
+    after = pre - tax
+    cash = bid_w + t["total"] + extra_w - loan_w
+    return dict(t=t, sale_fee=sale_fee, interest=interest, gap=gap, pre=pre, tax=tax, note=note,
+                after=after, cash=cash)
+
+
+# ───────────────────────── 읽는 법 (도움말) ─────────────────────────
+
+GUIDE_ALL = """
+**이 앱이 하는 일**
+빌라 경매에서 가장 어려운 시세 조사를 돕습니다. 핵심 질문은 두 가지입니다.
+**① 누구에게 팔 수 있을까? ② 얼마에 팔 수 있을까?**
+싸게 사는 것보다 **이 동네에서 실제로 팔리는 빌라를 싸게 사는 것**이 중요하다는 원칙에 맞춰 만들었습니다.
+
+**추천 순서**
+1. **왼쪽 메뉴**에 경매 물건의 지번 주소, 전용면적, 건축년도, 층, 최저가(호수는 선택)를 넣고 **시세 조회**를 누릅니다.
+2. **동네 프로필**: 이 동네에서 잘 팔리는 빌라 유형에 이 물건이 맞는지 봅니다. 안 맞으면 여기서 거릅니다.
+3. **비교사례**: 주변 비슷한 빌라의 실제 거래가를 보고, 임장할 곳을 체크해 동선을 짭니다.
+4. **예상 매도가**: 팔 수 있는 가격을 정하고, 최대 입찰가를 역산합니다.
+5. **전월세**: 안 팔릴 때 전세로 버틸 수 있는지, 투자금이 얼마나 묶이는지 봅니다.
+6. **건물·입지**: 근생·주차·엘리베이터와 주변 학교·역·병원으로 매수층을 확인합니다.
+7. **임장 체크**: 현장에서 확인할 것을 체크하고, **인쇄**로 뽑아 들고 갑니다.
+8. **계산기**: 세후 수익과 입찰가별 수익표로 입찰가를 최종 결정합니다.
+
+**데이터 출처**
+- 매매·전월세: 국토교통부 실거래가 (계약 후 30일 안에 신고되어 최근 1–2달은 덜 잡힘)
+- 동·호수, 건물 정보: 건축물대장 (호수는 층·면적으로 맞춘 추정)
+- 위치, 주변 시설, 지하철역: 카카오 지도
+
+**알아둘 점**
+- 데이터는 **방향을 잡는 도구**이고, 확인은 현장에서 합니다. 앱 결과만 믿고 입찰하지 마세요.
+- 위반건축물, 권리관계(등기부·매각물건명세서)는 앱에 나오지 않으니 직접 확인합니다.
+- 입력과 체크는 새로고침해도 유지됩니다. 새 물건을 볼 때는 **처음부터 다시(리셋)**를 누르세요.
+"""
+
+GUIDES = {
+"동네 프로필": """
+**왜 보나요?** 잘 팔리는 빌라는 **동네마다 다릅니다.** 어떤 동네는 2억대 20평대 준신축이, 어떤 동네는 1억 미만 10평대 30년 넘은 저층이 잘 팔립니다. 실제 매수자들이 돈을 주고 산 빌라의 특징을 먼저 봅니다.
+
+**읽는 법**
+- 그래프 4개(매매금액·전용평수·연식·층)는 이 동네에서 최근 팔린 빌라의 분포입니다. **막대가 높을수록 잘 팔리는 구간**입니다.
+- **빨간 막대**가 이 물건이 속한 구간입니다. 아래 '거래 비중'과 '순위'를 봅니다. 1–2위면 잘 팔리는 구간입니다.
+- 매매금액은 **최저가 기준**이라 실제 매도가와 구간이 다를 수 있습니다.
+- 4개 중 3개 이상 맞으면 임장 후보, 2개 이하면 손품 단계에서 거르는 것을 권합니다.
+
+**동네 시장 온도**
+- 막대는 월별 거래 건수, 빨간 선은 평단가입니다. 최근 3개월을 직전 3개월과 비교합니다.
+- 거래가 줄고 가격이 내려가면(❄️) 예상 매도가를 보수적으로, 거래가 늘면(🌤·🔥) 매도가 수월합니다.
+- 이번 달과 지난달은 신고가 덜 들어와 건수가 낮게 보일 수 있습니다.
+
+**평수로 매수층 짐작하기**: 10–15평은 1–2인(노인 부부·신혼), 15–20평은 2–3인, 20–25평은 3–4인 가구가 주로 삽니다.
+""",
+"비교사례": """
+**왜 보나요?** 예상 매도가는 부동산 사장님께 묻는 게 아니라 **집에서 정하고 가는 것**입니다. 그 근거가 주변의 비슷한 빌라 실거래입니다.
+
+**읽는 법**
+- 왼쪽 메뉴의 **반경·전용평수 범위·연식 범위** 조건에 맞는 최근 거래만 모았습니다. 건수가 너무 적으면 조건을 넓힙니다.
+- 지도: **빨간 테두리**가 경매 물건, **파란 점**이 거래(클수록 같은 건물 거래가 많음)입니다. 파란 점이 많고 촘촘할수록 이 물건도 팔릴 가능성이 높습니다.
+- **동·호**는 층·면적을 건축물대장과 맞춘 추정입니다. '?'가 붙으면 후보가 여러 개입니다.
+- 거리가 0m인 거래는 **같은 건물의 다른 호수**라 가장 중요한 비교 대상입니다.
+- **층**도 봅니다. 같은 건물이라도 지하·1층·고층은 가격이 다릅니다. 이 물건과 같은 층이 팔린 적이 있는지 확인합니다.
+- **카카오맵·로드뷰** 링크로 건물 외관, 골목 경사, 주차를 미리 봅니다.
+
+**임장 동선**: '임장' 칸을 체크하면 가까운 지하철역에서 출발하는 최단 방문 순서를 짜 줍니다. 비교 임장은 2–3곳이 적당합니다.
+""",
+"예상 매도가": """
+**왜 보나요?** 입찰가는 **예상 매도가에서 거꾸로** 계산합니다.
+**최대 입찰가 = 예상 매도가 − (수리비 + 부대비용 + 희망 차익)**
+
+**읽는 법**
+- 예상 매도가 = 비교사례 **평단가 중앙값 × 이 물건 전용평수**입니다.
+- **평단가 편차 경고**: 같은 조건인데 평단가가 2배 이상 차이 나면, 컨설팅 업체가 실거래가를 부풀려 신고한 **업계약** 가능성이 있습니다. 이상치는 자동으로 빼고 계산합니다.
+- **적용 평단가**는 직접 고칠 수 있습니다. 같은 층·비슷한 상태의 거래를 보고 현실적인 값으로 조정하세요.
+- 평단가 그래프에서 빨간 막대가 적용 평단가 구간입니다. 가장 많이 몰린 구간과 비교해 봅니다.
+
+**희망 차익의 기준(강의 어림값, 매매사업자 6–15% 구간)**: 차익 2,500만 → 세후 약 1천만, 4,000만 → 약 2천만, 5,000만 → 약 3천만. 정확한 값은 계산기 탭에서 봅니다.
+""",
+"전월세": """
+**왜 보나요?** 빌라는 아파트보다 매도에 시간이 걸릴 수 있습니다. **안 팔리면 전세로 버틸 수 있는지**, 그때 투자금이 얼마나 묶이는지 미리 봐야 합니다.
+
+**읽는 법**
+- **예상 전세가** = 주변 비슷한 빌라의 전세 평단가 중앙값 × 전용평수입니다.
+- **전세가율** = 예상 전세가 ÷ 예상 매도가
+  - 50–80%: 안 팔리면 전세로 투자금 일부를 회수하며 버틸 수 있는 구간
+  - 80% 이상: 회수는 쉽지만 매매가가 떨어지면 역전세 위험, 세입자가 보증보험 가입을 따질 수 있음
+  - 50% 미만: 전세를 놓아도 묶이는 돈이 많아 매도 위주로 계획
+- **전세 후 남는 투자금** = 최대 입찰가 − 예상 전세가 (취득세·수리비는 따로 더하세요)
+- **월세 수익률** = 월세×12 ÷ (입찰가 − 보증금)
+- **신규 계약만 보기**를 켜 두세요. 갱신 계약은 인상률 5% 상한 때문에 시세보다 낮게 잡힙니다.
+""",
+"건물·입지": """
+**왜 보나요?** 같은 가격이라도 **주차·엘리베이터·학교·역**에 따라 살 사람이 달라집니다. 서류상 문제(근생)는 대출과 매도를 막습니다.
+
+**건물 정보 읽는 법**
+- **근생빌라**: 서류상 '근린생활시설'인데 주거로 쓰는 호실입니다. 대출이 잘 안 나오고 이행강제금 위험이 있습니다. 빨간 경고가 뜨면 특히 주의합니다.
+- **엘리베이터 없는 4층 이상**: 고층 호실은 노인·어린 자녀 가구가 꺼립니다.
+- **주차**: 세대당 0.5대 미만이면 차가 있는 3–4인 가구에게 팔기 어렵습니다. 노인 가구 대상이면 덜 중요합니다.
+- **호수 입력** 시 그 호실의 서류상 용도와 면적을 확인합니다. 입력한 면적과 다르면 경매 정보를 다시 봅니다.
+- **위반건축물**은 이 자료에 없습니다. 정부24에서 건축물대장 첫 장 오른쪽 위 '위반건축물' 표시와 매각물건명세서 비고란을 확인하세요.
+
+**입지 읽는 법**
+- 경매 물건에서 가장 가까운 시설까지의 거리와 도보 시간입니다(직선거리 기준 추정).
+- 매수층별로 중요한 시설이 다릅니다.
+  - 3–4인 가구: 초등학교, 대형마트
+  - 1–2인 직장인: 지하철역, 버스정류장, 편의점
+  - 노인 가구: 병원, 약국 (+저층)
+  - 신혼·영유아: 어린이집, 공원
+- 아래 '누구에게 팔까'는 거리로 본 참고 의견입니다. 언덕, 큰길 건너기는 로드뷰로 확인합니다.
+""",
+"임장 체크": """
+**왜 보나요?** **손품이 임장보다 중요합니다.** 집에서 걸러낸 물건만 임장 가고, 현장에서는 미리 정한 내용을 **확인만** 합니다. 그래야 하루에 여러 곳을 볼 수 있습니다.
+
+**읽는 법**
+- 맨 위 **'이 물건에서 특히 볼 것'**은 다른 탭의 경고(근생, 엘리베이터, 주차, 업계약, 지하층, 노후 건물)를 모은 것입니다. 현장에서 가장 먼저 확인합니다.
+- 체크리스트는 출발 전 → 건물 외부 → 호실 → 동네 → 부동산 → 입찰 전 순서입니다.
+- 체크한 항목은 새로고침해도 남고, **인쇄**하면 ☑/☐로 나와 현장에서 들고 다닐 수 있습니다.
+- **부동산 방문 요령**: "얼마에 팔려요?"가 아니라 "이 가격에 내놓으면 얼마나 걸려요?"로 묻습니다. 기준 없이 가면 사장님 말에 끌려갑니다.
+""",
+"계산기": """
+**왜 보나요?** 같은 차익이라도 세금·이자·중개보수를 빼면 남는 돈이 크게 달라집니다. 입찰가는 **세후 수익**으로 정합니다.
+
+**경매 수익 읽는 법**
+- 낙찰가·예상 매도가는 예상 매도가 탭 값으로 처음 채워집니다. 수리비·명도비·대출·보유 기간을 넣습니다.
+- **세금 방식**: 매매사업자(종합소득세 6–45%)와 개인 양도세(1년 미만 70%, 2년 미만 60%)를 바꿔 보며 비교합니다. 단기 매도는 매매사업자가 훨씬 유리한 경우가 많습니다.
+- **입찰가별 수익표**: 목표 세후 수익을 넣으면 **그 목표를 지키는 최고 입찰가**를 알려 줍니다. ✅가 붙은 줄까지가 목표 달성 범위입니다.
+- **필요 현금** = 낙찰가 + 취득세 + 수리·명도·기타 − 대출금. 수익률은 이 현금 대비입니다.
+
+**다른 계산기**: 중개보수(법정 상한요율), 취득세(주택 수·조정지역·85㎡·공시가 1억 이하 중과 제외), 대출 이자(상환 방식별).
+
+**주의**: 법정 세율 기준 어림값입니다. 매매사업자도 중과 대상 주택은 양도세와 비교해 과세(비교과세)될 수 있으니, 실제 입찰 전 세무사와 확인하세요.
+""",
+}
 
 
 # ───────────────────────── 차트 ─────────────────────────
@@ -717,7 +957,7 @@ if run or auto:
             except PermissionError:
                 st.error("공공데이터포털이 접근을 거부했습니다(403). 마이페이지 → 데이터활용 → 활용신청 현황에서 "
                          "'국토교통부_연립다세대 매매 실거래가 자료'가 승인 상태인지 확인하세요. "
-                         "승인 직후라면 키가 반영되기까지 1~2시간 걸릴 수 있습니다.")
+                         "승인 직후라면 키가 반영되기까지 1–2시간 걸릴 수 있습니다.")
                 st.stop()
             except Exception as e:
                 st.warning(f"{ymd} 조회 실패: {str(e).split(' for url')[0]}")
@@ -753,7 +993,9 @@ if run or auto:
 </script>""", height=0)
 
 if "trades" not in st.session_state:
-    st.info("왼쪽에 경매 물건 정보를 입력하고 시세 조회를 누르세요.")
+    st.info("왼쪽에 경매 물건 정보를 입력하고 시세 조회를 누르세요. (휴대폰은 왼쪽 위 >> 버튼)")
+    with st.expander("📘 앱 전체 사용법 (처음이면 읽어 보세요)", expanded=True):
+        st.markdown(GUIDE_ALL)
     st.stop()
 
 trades = st.session_state.trades
@@ -797,9 +1039,20 @@ components.html("""<script>
 })();
 </script>""", height=0)
 report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None, "ck": None,
-          "calc": None}
+          "calc": None, "rent": None, "loc": None}
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["동네 프로필", "비교사례", "예상 매도가", "건물 정보", "임장 체크", "계산기"])
+with st.expander("📘 앱 전체 사용법"):
+    st.markdown(GUIDE_ALL)
+
+tab1, tab2, tab3, tab_rent, tab4, tab5, tab6 = st.tabs(
+    ["동네 프로필", "비교사례", "예상 매도가", "전월세", "건물·입지", "임장 체크", "계산기"])
+
+# 각 탭 맨 위에 '읽는 법' 접힘 메뉴
+for _tb, _name in [(tab1, "동네 프로필"), (tab2, "비교사례"), (tab3, "예상 매도가"), (tab_rent, "전월세"),
+                   (tab4, "건물·입지"), (tab5, "임장 체크"), (tab6, "계산기")]:
+    with _tb:
+        with st.expander(f"📖 {_name} 탭 읽는 법"):
+            st.markdown(GUIDES[_name])
 
 # ── 동네 프로필
 with tab1:
@@ -831,6 +1084,56 @@ with tab1:
     (st.success if hits >= 3 else st.warning)(msg)
     report["verdict"] = msg
     report["n_dong"] = len(dong_df)
+
+    # ── 동네 시장 온도: 월별 거래량과 평단가 추이
+    st.markdown("#### 동네 시장 온도")
+    mt = dong_df.dropna(subset=["deal_date"]).copy()
+    if len(mt) >= 5:
+        mt["ym"] = mt["deal_date"].dt.to_period("M")
+        idx = pd.period_range(end=pd.Timestamp(date.today()).to_period("M"), periods=months, freq="M")
+        g = mt.groupby("ym").agg(cnt=("price", "size"), ppy=("ppy", "median")).reindex(idx)
+        g["cnt"] = g["cnt"].fillna(0).astype(int)
+        g["월"] = [p.strftime("%y.%m") for p in g.index]
+        base = alt.Chart(g.reset_index(drop=True)).encode(
+            x=alt.X("월:N", sort=list(g["월"]), title=None, axis=alt.Axis(labelAngle=-45, labelFontSize=11)))
+        bars = base.mark_bar(color="#a5c8ef").encode(
+            y=alt.Y("cnt:Q", title="거래 건수"), tooltip=[alt.Tooltip("월"), alt.Tooltip("cnt", title="거래")])
+        line = base.mark_line(color="#E03131", point=True).encode(
+            y=alt.Y("ppy:Q", title="평단가(만원)", scale=alt.Scale(zero=False)),
+            tooltip=[alt.Tooltip("월"), alt.Tooltip("ppy", title="평단가", format=",.0f")])
+        st.altair_chart(alt.layer(bars, line).resolve_scale(y="independent").properties(height=230),
+                        use_container_width=True)
+        st.caption("막대: 월별 거래 건수 · 빨간 선: 월별 평단가 중앙값. 실거래 신고는 계약 후 30일 안에 하므로 "
+                   "이번 달과 지난달은 건수가 더 늘어날 수 있습니다.")
+
+        done = g.iloc[:-1]  # 이번 달(미완성) 제외
+        if len(done) >= 6:
+            recent, prev = done.iloc[-3:], done.iloc[-6:-3]
+            c_chg = (recent["cnt"].sum() / prev["cnt"].sum() - 1) * 100 if prev["cnt"].sum() else None
+            r_ppy = mt[mt["ym"].isin(recent.index)]["ppy"].median()
+            p_ppy = mt[mt["ym"].isin(prev.index)]["ppy"].median()
+            p_chg = (r_ppy / p_ppy - 1) * 100 if p_ppy and not pd.isna(r_ppy) else None
+            t1, t2 = st.columns(2)
+            t1.metric("거래량 (최근 3개월)", f"{int(recent['cnt'].sum())}건",
+                      f"{c_chg:+.0f}% (직전 3개월 대비)" if c_chg is not None else None)
+            t2.metric("평단가 (최근 3개월)", f"{r_ppy:,.0f}만" if not pd.isna(r_ppy) else "-",
+                      f"{p_chg:+.1f}%" if p_chg is not None else None)
+            if c_chg is not None and p_chg is not None:
+                if c_chg >= 15 and p_chg >= 2:
+                    temp = ("🔥 달아오르는 중", "거래도 늘고 가격도 오릅니다. 매도는 수월하지만 입찰 경쟁이 세질 수 있습니다.")
+                elif c_chg >= 15:
+                    temp = ("🌤 회복 중", "가격은 그대로인데 거래가 늘고 있습니다. 매도하기 좋은 흐름입니다.")
+                elif c_chg <= -15 and p_chg <= -2:
+                    temp = ("❄️ 식는 중", "거래도 줄고 가격도 내려갑니다. 예상 매도가를 보수적으로 잡으세요.")
+                elif c_chg <= -15:
+                    temp = ("🌥 주춤", "거래가 줄고 있습니다. 매도 기간이 길어질 수 있습니다.")
+                else:
+                    temp = ("🌡 보합", "거래량과 가격 모두 큰 변화가 없습니다.")
+                st.info(f"**{temp[0]}** — {temp[1]}")
+                report["temp"] = dict(label=temp[0], text=temp[1], cnt=int(recent["cnt"].sum()),
+                                      c_chg=c_chg, ppy=r_ppy, p_chg=p_chg)
+    else:
+        st.info("거래가 적어 추이를 보기 어렵습니다. 조회 기간을 늘려 보세요.")
 
 # ── 비교사례
 with tab2:
@@ -1040,7 +1343,7 @@ with tab3:
     else:
         if est["spread"] >= 2.0 or est["n_out"] > 0:
             st.warning(
-                f"평단가가 {won(est['min'])}~{won(est['max'])}으로 {est['spread']:.1f}배 차이 납니다. "
+                f"평단가가 {won(est['min'])}–{won(est['max'])}으로 {est['spread']:.1f}배 차이 납니다. "
                 f"이상치 {est['n_out']}건은 업계약(컨설팅 작업) 가능성이 있어 계산에서 뺐습니다.")
         sig = (int(round(est["median"])), est["n"])
         if st.session_state.get("ppy_sig") != sig:
@@ -1053,7 +1356,7 @@ with tab3:
         sell = ppy * area_py
         a, b, c = st.columns(3)
         a.metric("예상 매도가", won(sell))
-        b.metric("평단가 범위 (중간 50%)", f"{est['p25']:,.0f}~{est['p75']:,.0f}만")
+        b.metric("평단가 범위 (중간 50%)", f"{est['p25']:,.0f}–{est['p75']:,.0f}만")
         c.metric("비교 거래", f"{est['n']}건")
         ppy_bins = list(range(int(comps["ppy"].min() // 100 * 100), int(comps["ppy"].max()) + 101, 100))
         ppy_dist = pd.cut(comps["ppy"], bins=ppy_bins, right=False).value_counts().sort_index()
@@ -1076,6 +1379,102 @@ with tab3:
 
 
 
+# ── 전월세 (전세가율 · 투자금 회수)
+with tab_rent:
+    ss = st.session_state
+    lawd = ss.get("b_code", "")[:5]
+    rkey = (lawd, months)
+    if ss.get("rent_key") != rkey:
+        with st.spinner(f"최근 {months}개월 전월세 실거래를 불러오는 중"):
+            url, err = find_rent_url(data_key, lawd, recent_months(1)[0])
+            rows = []
+            if url:
+                for ym in recent_months(months):
+                    try:
+                        rows += fetch_month(data_key, lawd, ym, url)
+                    except Exception:
+                        pass
+            ss.rents, ss.rent_err, ss.rent_key = clean_rents(rows), (err if not url else ""), rkey
+    rents, rent_err = ss.get("rents", pd.DataFrame()), ss.get("rent_err", "")
+
+    if rent_err:
+        st.error(f"전월세 자료를 불러오지 못했습니다: {rent_err}. 공공데이터포털에서 "
+                 "'국토교통부_연립다세대 전월세 실거래가 자료'를 활용신청하고, 승인 후 다시 열어 보세요.")
+    elif rents.empty:
+        st.info("이 지역의 빌라 전월세 실거래가 없습니다.")
+    else:
+        rc = rents[rents["area_py"].between(area_py - area_tol, area_py + area_tol)
+                   & rents["age"].between(age - age_tol, age + age_tol) & (rents["jibun"] != "")].copy()
+        rc["q"] = ss.sgg + " " + rc["dong"].astype(str) + " " + rc["jibun"]
+        with st.spinner(f"{rc['q'].nunique()}개 주소 위치 확인 중"):
+            geo_r = geocode_many(kakao_key, rc["q"].tolist())
+        rc["lat"] = rc["q"].map(lambda q: (geo_r.get(q) or [None])[0])
+        rc["lon"] = rc["q"].map(lambda q: (geo_r.get(q) or [None, None])[1])
+        rc = rc.dropna(subset=["lat", "lon"])
+        rc["dist_m"] = [haversine_m(lat0, lon0, a, b) for a, b in zip(rc["lat"], rc["lon"])]
+        rc = rc[rc["dist_m"] <= radius].sort_values("deal_date", ascending=False)
+
+        has_ctype = rc["ctype"].str.len().gt(0).any()
+        new_only = st.toggle("신규 계약만 보기 (갱신 계약 제외)", value=bool(has_ctype), disabled=not has_ctype,
+                             help="갱신 계약은 인상률 5% 상한 때문에 시세보다 낮게 잡힐 수 있습니다.")
+        if new_only and has_ctype:
+            rc = rc[rc["ctype"].str.contains("신규")]
+        jeonse, wolse = rc[rc["kind"] == "전세"], rc[rc["kind"] == "월세"]
+        st.write(f"반경 {radius}m · 전용 {area_py:.1f}±{area_tol}평 · 연식 {age}±{age_tol}년 → "
+                 f"전세 **{len(jeonse)}건**, 월세 **{len(wolse)}건**")
+
+        est3 = report.get("est") or {}
+        sell = est3.get("sell")
+        bid = est3.get("bid", min_bid)
+        rent_rep = {}
+        if len(jeonse):
+            s_ppy = jeonse["dep_ppy"]
+            q1, q3 = s_ppy.quantile(0.25), s_ppy.quantile(0.75)
+            iq = s_ppy[(s_ppy >= q1 - 1.5 * (q3 - q1)) & (s_ppy <= q3 + 1.5 * (q3 - q1))]
+            j_price = iq.median() * area_py
+            m1, m2, m3 = st.columns(3)
+            m1.metric("예상 전세가", won(j_price))
+            m2.metric("전세가율", f"{j_price / sell * 100:.0f}%" if sell else "-",
+                      help="예상 전세가 ÷ 예상 매도가")
+            left = bid - j_price
+            m3.metric("전세 후 남는 투자금", won(left) if left > 0 else f"{won(-left)} 회수 초과",
+                      help="최대 입찰가 − 예상 전세가. 취득세·수리비는 따로 더해야 합니다.")
+            st.caption(f"전세 평단가 중간 50% {iq.quantile(0.25):,.0f}–{iq.quantile(0.75):,.0f}만 · "
+                       f"기준 낙찰가 {won(bid)}(예상 매도가 탭의 최대 입찰가)")
+            if sell:
+                ratio = j_price / sell
+                if ratio >= 0.8:
+                    st.warning("전세가율이 80% 이상입니다. 전세로 투자금 회수는 쉽지만, 매매가가 떨어지면 "
+                               "역전세 위험이 크고 세입자가 전세보증보험 가입을 확인할 수 있습니다.")
+                elif ratio < 0.5:
+                    st.info("전세가율이 50% 미만입니다. 전세를 놓아도 묶이는 돈이 많아, 매도 위주로 계획하는 게 좋습니다.")
+                else:
+                    st.success("전세가율이 50–80%입니다. 안 팔리면 전세로 버티며 투자금 일부를 회수할 수 있는 구간입니다.")
+            rent_rep.update(j_price=j_price, ratio=(j_price / sell if sell else None), left=left, nj=len(jeonse))
+        else:
+            st.info("조건에 맞는 전세 거래가 없습니다. 반경이나 허용 범위를 넓혀 보세요.")
+
+        if len(wolse):
+            dep_med, rent_med = wolse["deposit"].median(), wolse["rent"].median()
+            invest = bid - dep_med
+            yld = rent_med * 12 / invest * 100 if invest > 0 else None
+            w1, w2 = st.columns(2)
+            w1.metric("월세 시세 (중앙값)", f"{won(dep_med)} / {rent_med:,.0f}만")
+            w2.metric("월세 수익률 (연)", f"{yld:.1f}%" if yld else "-",
+                      help="월세×12 ÷ (최대 입찰가 − 보증금). 세금·공실·수리비 제외")
+            rent_rep.update(dep_med=dep_med, rent_med=rent_med, yld=yld, nw=len(wolse))
+
+        if len(rc):
+            tbl = rc.assign(
+                계약일=rc["deal_date"].dt.strftime("%y.%m.%d"), 구분=rc["kind"],
+                거리=rc["dist_m"].round().astype(int).astype(str) + "m", 전용평=rc["area_py"].round(1),
+                보증금=rc["deposit"].map(won), 월세=rc["rent"].map(lambda v: f"{v:,.0f}만" if v else "-"),
+            )[["계약일", "구분", "name", "거리", "전용평", "build_year", "floor", "보증금", "월세", "ctype"]]
+            st.dataframe(tbl.rename(columns={"name": "건물명", "build_year": "건축년도", "floor": "층",
+                                             "ctype": "계약"}), hide_index=True, use_container_width=True)
+        report["rent"] = rent_rep or None
+
+
 # ── 건물 정보 (건축물대장)
 def ymd(v: str) -> str:
     return f"{v[:4]}.{v[4:6]}.{v[6:8]}" if v and len(v) == 8 and v.isdigit() else "-"
@@ -1089,17 +1488,6 @@ def to_num(v, default=0.0) -> float:
 
 
 with tab4:
-    with st.expander("빌라 경매에서 건물 정보를 보는 법"):
-        st.markdown(
-            "- **근생빌라 여부**: 건축물대장 전유부에 호실별 용도가 나옵니다. 서류상 '제2종근린생활시설'인데 "
-            "주거로 쓰는 호실이면 대출이 잘 안 나오고 이행강제금 위험이 있습니다.\n"
-            "- **건물 기본 정보(표제부)**: 사용승인일, 구조(철근콘크리트·벽돌 등), 세대수, 층수, 엘리베이터 수, "
-            "주차대수, 대지면적과 용적률이 나옵니다. \"주차 자리가 있나\", \"엘리베이터가 있나\"처럼 "
-            "누구에게 팔지 판단할 때 필요한 정보입니다.\n"
-            "- **위반건축물 여부**: 건축물대장 API의 표제부에는 위반 여부 항목이 없습니다. 정부24에서 "
-            "건축물대장을 떼어 첫 장 오른쪽 위의 '위반건축물' 표시를 확인하는 게 확실하고, "
-            "매각물건명세서 비고란도 함께 보세요."
-        )
     ss = st.session_state
     bc, tj = ss.get("b_code", ""), ss.get("t_jibun", "")
     store = expos_store()
@@ -1148,7 +1536,7 @@ with tab4:
                 if not elev and grnd >= 4:
                     bld["checks"].append(("warn", f"엘리베이터 없는 지상 {grnd}층 건물입니다. 고층 호실은 노인·어린 자녀 가구가 꺼려 매수층이 좁습니다."))
                 if hh and park / hh < 0.5:
-                    bld["checks"].append(("warn", f"세대당 주차 {park / hh:.1f}대로 부족한 편입니다. 차가 있는 3~4인 가구에는 팔기 어려울 수 있습니다."))
+                    bld["checks"].append(("warn", f"세대당 주차 {park / hh:.1f}대로 부족한 편입니다. 차가 있는 3–4인 가구에는 팔기 어려울 수 있습니다."))
                 if "근린생활" in (t.get("mainPurpsCdNm", "") + t.get("etcPurps", "")):
                     bld["checks"].append(("err", "건물 주용도에 근린생활시설이 포함되어 있습니다. 호실별 용도를 꼭 확인하세요."))
         elif isinstance(titles, list):
@@ -1180,6 +1568,50 @@ with tab4:
         for kind, msg in bld["checks"]:
             {"ok": st.success, "warn": st.warning, "err": st.error, "info": st.info}[kind](msg)
         report["bld"] = bld
+
+# ── 입지 (건물·입지 탭 아래쪽)
+with tab4:
+    st.markdown("#### 입지: 가까운 생활 시설")
+    rows_loc = []
+    with st.spinner("주변 시설 확인 중"):
+        for label, params, who in PLACES:
+            p = nearest_place(kakao_key, round(lat0, 5), round(lon0, 5), json.dumps(params, ensure_ascii=False))
+            if p:
+                walk = p["dist"] * WALK_FACTOR / WALK_M_PER_MIN
+                rows_loc.append(dict(시설=label, 이름=p["name"], 거리=f"{p['dist']:,}m",
+                                     도보=f"약 {walk:.0f}분", 매수층=who,
+                                     지도=kakao_map_link(p["name"], p["lat"], p["lon"]), _min=walk))
+            else:
+                rows_loc.append(dict(시설=label, 이름="2km 안에 없음", 거리="-", 도보="-", 매수층=who,
+                                     지도=None, _min=None))
+    loc_df = pd.DataFrame(rows_loc)
+    st.dataframe(loc_df.drop(columns=["_min"]), hide_index=True, use_container_width=True,
+                 column_config={"지도": st.column_config.LinkColumn("지도", display_text="보기", width="small")})
+    mins = {r["시설"]: r["_min"] for r in rows_loc}
+
+    def near(k, m):
+        return mins.get(k) is not None and mins[k] <= m
+    fits = []
+    if near("초등학교", 10) and (near("대형마트", 20) or near("편의점", 5)):
+        fits.append("**3–4인 가구**: 초등학교가 도보 10분 안이라 자녀 가구에게 팔기 좋습니다.")
+    elif not near("초등학교", 15):
+        fits.append("**3–4인 가구**: 초등학교가 멀어 자녀 가구에게는 약점입니다.")
+    if near("지하철역", 10):
+        fits.append("**1–2인 직장인**: 지하철역이 도보 10분 안이라 출퇴근 수요가 있습니다.")
+    elif not near("지하철역", 15) and not near("버스정류장", 5):
+        fits.append("**1–2인 직장인**: 지하철과 버스가 모두 멀어 차 없는 직장인에게 약점입니다.")
+    if near("병원", 10) and near("약국", 10):
+        fits.append("**노인 가구**: 병원·약국이 가까워 노인 부부에게 맞습니다. 저층이면 더 유리합니다.")
+    if near("어린이집·유치원", 7) and near("공원", 10):
+        fits.append("**신혼·영유아 가구**: 어린이집과 공원이 가까워 어린 자녀 가구에게 맞습니다.")
+    if fits:
+        st.markdown("**누구에게 팔까 (거리 기준 참고)**")
+        for f in fits:
+            st.markdown(f"- {f}")
+    st.caption("거리는 직선거리, 도보 시간은 1.3배 보정한 추정입니다. 언덕·큰길 건너기 여부는 로드뷰로 확인하세요.")
+    report["loc"] = dict(rows=[{k: v for k, v in r.items() if k not in ("지도", "_min")} for r in rows_loc],
+                         fits=[f.replace("**", "") for f in fits])
+
 
 # ── 임장 체크리스트
 with tab5:
@@ -1236,6 +1668,7 @@ with tab6:
         "c_sell": max(0, int(r_est.get("sell", min_bid * 1.4))),
         "c_repair": int(ss.get("w_rp", 500)), "c_evict": 100, "c_etc": 100,
         "c_taxmode": "매매사업자(종합소득세)",
+        "c_target": 1000,
     }
     for k, d in c_defaults.items():
         if k not in ss:
@@ -1339,25 +1772,12 @@ with tab6:
         st.radio("세금 계산", modes, key="c_taxmode", horizontal=True)
 
         bid_w, sell_w = ss.c_bid * 1e4, ss.c_sell * 1e4
-        t = acq_tax(bid_w, ss.c_houses, ss.c_adj, area_m2 > 85, False, ss.c_low)
-        sale_fee = brokerage_fee(sell_w, FEE_SALE)[0] * 1.1      # 부가세 포함
-        interest = ss.c_loan * 1e4 * ss.c_irate / 100 / 12 * ss.c_months
-        costs = t["total"] + (ss.c_repair + ss.c_evict + ss.c_etc) * 1e4 + sale_fee + interest
-        gap = sell_w - bid_w
-        pre_tax = gap - costs
-        if ss.c_taxmode.startswith("매매사업자"):
-            tax = progressive_tax(pre_tax) * 1.1                  # 지방소득세 10% 포함
-            tax_note = "다른 소득이 없다고 보고 종합소득세 기본세율(6~45%)과 지방소득세를 적용"
-        else:
-            base = max(pre_tax - interest - 2.5e6, 0)            # 양도세는 대출이자를 필요경비로 인정 안 함
-            if ss.c_months < 12:
-                tax, tax_note = base * 0.70 * 1.1, "1년 미만 보유 주택 70% + 지방세"
-            elif ss.c_months < 24:
-                tax, tax_note = base * 0.60 * 1.1, "2년 미만 보유 주택 60% + 지방세"
-            else:
-                tax, tax_note = progressive_tax(base) * 1.1, "2년 이상 보유, 기본세율 + 지방세"
-        after = pre_tax - tax
-        own_cash = bid_w + costs - sale_fee - interest - ss.c_loan * 1e4
+        extra_w = (ss.c_repair + ss.c_evict + ss.c_etc) * 1e4
+        args = (sell_w, extra_w, ss.c_loan * 1e4, ss.c_irate, ss.c_months, ss.c_houses, ss.c_adj,
+                area_m2 > 85, ss.c_low, ss.c_taxmode)
+        pf = auction_profit(bid_w, *args)
+        t, sale_fee, interest, gap, pre_tax = pf["t"], pf["sale_fee"], pf["interest"], pf["gap"], pf["pre"]
+        tax, tax_note, after, own_cash = pf["tax"], pf["note"], pf["after"], pf["cash"]
         m1, m2, m3 = st.columns(3)
         m1.metric("매매 차익 (매도가 − 낙찰가)", won(gap / 1e4))
         m2.metric("세전 순이익", won(pre_tax / 1e4))
@@ -1373,8 +1793,52 @@ with tab6:
         ], columns=["항목", "금액"]).set_index("항목"))
         st.caption("매매사업자도 조정대상지역 다주택 등 중과 대상 주택은 양도세와 비교해 큰 쪽으로 과세될 수 있습니다(비교과세). "
                    "정확한 세금은 세무사와 확인하세요.")
+        # ── 입찰가별 수익표
+        st.markdown("#### 입찰가별 수익표")
+        st.number_input("목표 세후 수익 (만원)", 0, 1_000_000, step=100, key="c_target")
+        target_w = ss.c_target * 1e4
+        # 목표를 맞추는 최고 낙찰가를 이분 탐색으로 찾음 (낙찰가가 오를수록 수익은 줄어듦)
+        lo_b, hi_b = 0.0, sell_w
+        if auction_profit(lo_b, *args)["after"] < target_w:
+            max_bid = None
+        else:
+            for _ in range(40):
+                mid = (lo_b + hi_b) / 2
+                lo_b, hi_b = (mid, hi_b) if auction_profit(mid, *args)["after"] >= target_w else (lo_b, mid)
+            max_bid = lo_b
+        if max_bid is not None and max_bid >= min_bid * 1e4:
+            st.success(f"세후 {won(ss.c_target)}을 남기려면 **최대 {won(max_bid / 1e4)}**까지 쓸 수 있습니다 "
+                       f"(최저가 대비 {max_bid / (min_bid * 1e4) * 100:.0f}%).")
+        elif max_bid is not None:
+            st.error(f"세후 {won(ss.c_target)}을 남기려면 {won(max_bid / 1e4)} 이하로 낙찰받아야 하는데, "
+                     f"최저가 {won(min_bid)}보다 낮습니다. 이 조건으로는 목표 달성이 어렵습니다.")
+        else:
+            st.error("예상 매도가로는 목표 세후 수익을 낼 수 없습니다.")
+
+        start = min_bid * 1e4
+        end = max(max_bid or start, bid_w, start) * 1.08
+        steps = 8
+        levels = sorted({round((start + (end - start) * i / steps) / 1e5) * 1e5 for i in range(steps + 1)}
+                        | ({round(max_bid / 1e5) * 1e5} if max_bid and max_bid >= start else set()))
+        rows_b = []
+        for b_w in levels:
+            p = auction_profit(b_w, *args)
+            rows_b.append({
+                "낙찰가": won(b_w / 1e4),
+                "최저가 대비": f"{b_w / start * 100:.0f}%",
+                "매도가 대비": f"{b_w / sell_w * 100:.0f}%" if sell_w else "-",
+                "세전 순이익": won(p["pre"] / 1e4),
+                "세후 순이익": won(p["after"] / 1e4),
+                "필요 현금": won(p["cash"] / 1e4),
+                "수익률": f"{p['after'] / p['cash'] * 100:.0f}%" if p["cash"] > 0 else "-",
+                "목표": "✅" if p["after"] >= target_w else "",
+            })
+        st.dataframe(pd.DataFrame(rows_b), hide_index=True, use_container_width=True)
+        st.caption("대출금은 위에 넣은 금액으로 고정해 계산합니다. 낙찰가에 비례해 대출이 늘면 필요 현금은 줄고 이자는 늘어납니다.")
+
         report["calc"] = dict(gap=gap, pre=pre_tax, after=after, tax=tax, note=tax_note,
-                              acq=t["total"], fee=sale_fee, interest=interest, cash=own_cash)
+                              acq=t["total"], fee=sale_fee, interest=interest, cash=own_cash,
+                              target=ss.c_target, max_bid=max_bid, table=rows_b)
 
 
 # ───────────────────────── 인쇄용 보고서 ─────────────────────────
@@ -1407,6 +1871,10 @@ def build_report_html() -> str:
         parts.append(f"<tr><td>{e(name)}</td><td>{e(label)}</td><td class='num'>{share:.0f}%</td>"
                      f"<td class='num'>{rank}위</td><td>{e(top)}</td></tr>")
     parts.append(f"</table><div class='box'>{e(report['verdict'])}</div>")
+    tp = report.get("temp")
+    if tp:
+        parts.append(f"<div class='box'>시장 온도: <b>{e(tp['label'])}</b> — 최근 3개월 거래 {tp['cnt']}건 "
+                     f"({tp['c_chg']:+.0f}%), 평단가 {tp['ppy']:,.0f}만 ({tp['p_chg']:+.1f}%). {e(tp['text'])}</div>")
 
     bl = report.get("bld")
     if bl and (bl["rows"] or bl["checks"]):
@@ -1423,12 +1891,36 @@ def build_report_html() -> str:
         est = r["est"]
         parts.append(f"""<h2>예상 매도가 · 입찰가</h2>
 <div class="grid"><div>예상 매도가<b>{won(r['sell'])}</b></div><div>적용 평단가<b>{r['ppy']:,.0f}만</b></div>
-<div>평단가 범위(중간 50%)<b>{est['p25']:,.0f}~{est['p75']:,.0f}만</b></div><div>최대 입찰가<b>{won(r['bid'])}</b></div></div>
+<div>평단가 범위(중간 50%)<b>{est['p25']:,.0f}–{est['p75']:,.0f}만</b></div><div>최대 입찰가<b>{won(r['bid'])}</b></div></div>
 <div class="box">예상 매도가 {won(r['sell'])} − 수리비 {won(r['repair'])} − 부대비용 {won(r['extra'])} − 희망 차익 {won(r['profit'])}
 = 최대 입찰가 {won(r['bid'])} (최저가 {won(min_bid)} 대비 {'+' if r['bid'] >= min_bid else '−'}{won(abs(r['bid'] - min_bid))})</div>""")
         if est["spread"] >= 2.0 or est["n_out"] > 0:
             parts.append(f"<div class='box warn'>평단가 편차 {est['spread']:.1f}배, 이상치 {est['n_out']}건 제외 "
                          f"(업계약 가능성 확인 필요)</div>")
+
+    rr = report.get("rent")
+    if rr:
+        parts.append("<h2>전월세</h2><table>")
+        if rr.get("j_price"):
+            ratio = f"{rr['ratio'] * 100:.0f}%" if rr.get("ratio") else "-"
+            parts.append(f"<tr><th>예상 전세가</th><td>{won(rr['j_price'])} (전세 {rr['nj']}건)</td>"
+                         f"<th>전세가율</th><td>{ratio}</td></tr>"
+                         f"<tr><th>전세 후 남는 투자금</th><td colspan='3'>{won(rr['left']) if rr['left'] > 0 else '회수 초과'}</td></tr>")
+        if rr.get("rent_med") is not None:
+            yld = f"{rr['yld']:.1f}%" if rr.get("yld") else "-"
+            parts.append(f"<tr><th>월세 시세</th><td>{won(rr['dep_med'])} / {rr['rent_med']:,.0f}만 ({rr['nw']}건)</td>"
+                         f"<th>월세 수익률</th><td>{yld}</td></tr>")
+        parts.append("</table>")
+
+    lc = report.get("loc")
+    if lc:
+        parts.append("<h2>입지</h2><table><tr><th>시설</th><th>이름</th><th>거리</th><th>도보</th><th>매수층</th></tr>")
+        for r in lc["rows"]:
+            parts.append(f"<tr><td>{e(r['시설'])}</td><td>{e(r['이름'])}</td><td class='num'>{e(r['거리'])}</td>"
+                         f"<td class='num'>{e(r['도보'])}</td><td>{e(r['매수층'])}</td></tr>")
+        parts.append("</table>")
+        for f in lc["fits"]:
+            parts.append(f"<div class='box'>{e(f)}</div>")
 
     cl = report.get("calc")
     if cl:
@@ -1438,6 +1930,13 @@ def build_report_html() -> str:
 <tr><th>대출 이자</th><td>{cl['interest']:,.0f}원</td><th>세금</th><td>{cl['tax']:,.0f}원</td></tr>
 <tr><th>세후 순이익</th><td><b>{won(cl['after'] / 1e4)}</b></td><th>필요 현금</th><td>{cl['cash']:,.0f}원</td></tr>
 </table><div class='box'>{e(cl['note'])}. 법정 세율 기준 어림값이며 실제 세금은 세무사와 확인하세요.</div>""")
+        if cl.get("table"):
+            mb = f"최대 {won(cl['max_bid'] / 1e4)}" if cl.get("max_bid") else "달성 어려움"
+            parts.append(f"<p><b>입찰가별 수익표</b> (목표 세후 {won(cl['target'])} → {mb})</p><table><tr>"
+                         + "".join(f"<th>{e(k)}</th>" for k in cl["table"][0]) + "</tr>")
+            for row in cl["table"]:
+                parts.append("<tr>" + "".join(f"<td class='num'>{e(str(v))}</td>" for v in row.values()) + "</tr>")
+            parts.append("</table>")
 
     rt = report.get("route")
     if rt:
