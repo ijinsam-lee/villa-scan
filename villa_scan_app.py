@@ -462,6 +462,85 @@ KEY_NOTES = """
 """
 
 
+# ───────────────────────── 계산기 (중개보수·취득세·대출·경매 수익) ─────────────────────────
+
+# 공인중개사법 시행규칙 별표1 (주택) — (구간 상한 원, 상한요율, 한도액 원)
+FEE_SALE = [(5e7, 0.006, 250_000), (2e8, 0.005, 800_000), (9e8, 0.004, None),
+            (12e8, 0.005, None), (15e8, 0.006, None), (float("inf"), 0.007, None)]
+FEE_LEASE = [(5e7, 0.005, 200_000), (1e8, 0.004, 300_000), (6e8, 0.003, None),
+             (12e8, 0.004, None), (15e8, 0.005, None), (float("inf"), 0.006, None)]
+
+
+def brokerage_fee(amount: float, table) -> tuple[float, float, float | None]:
+    """거래금액(원) → (상한 중개보수, 상한요율, 한도액)"""
+    for upper, rate, cap in table:
+        if amount < upper:
+            fee = amount * rate
+            return (min(fee, cap) if cap else fee), rate, cap
+    return 0.0, 0.0, None
+
+
+def monthly_rent_base(deposit: float, rent: float) -> float:
+    """월세 거래금액 환산: 보증금 + 월세×100, 5천만 원 미만이면 월세×70"""
+    base = deposit + rent * 100
+    return base if base >= 5e7 else deposit + rent * 70
+
+
+def acq_tax(price: float, houses_after: int, adjusted: bool, over85: bool,
+            corp: bool = False, low_value: bool = False) -> dict:
+    """주택 유상취득 취득세 (지방세법 §11·§13의2 기준 어림)"""
+    def basic():
+        if price <= 6e8:
+            return 1.0
+        if price <= 9e8:
+            return round(price / 1e8 * 2 / 3 - 3, 2)
+        return 3.0
+    if low_value:                      # 시가표준액 1억 원 이하 → 중과 제외
+        rate, why = basic(), "시가표준액 1억 원 이하 주택이라 중과 제외, 일반세율"
+    elif corp:
+        rate, why = 12.0, "법인 취득 중과"
+    elif houses_after <= 1 or (houses_after == 2 and not adjusted):
+        rate, why = basic(), "일반세율(1~3%)"
+    elif adjusted:
+        rate, why = (8.0, "조정대상지역 2주택 중과") if houses_after == 2 else (12.0, "조정대상지역 3주택 이상 중과")
+    else:
+        rate, why = (8.0, "비조정지역 3주택 중과") if houses_after == 3 else (12.0, "비조정지역 4주택 이상 중과")
+    heavy = rate >= 8
+    edu = 0.4 if heavy else rate / 10
+    agri = (0.6 if rate == 8 else 1.0 if rate == 12 else 0.2) if over85 else 0.0
+    tax, e, a = price * rate / 100, price * edu / 100, price * agri / 100
+    return dict(rate=rate, edu=edu, agri=agri, tax=tax, edu_tax=e, agri_tax=a,
+                total=tax + e + a, total_rate=rate + edu + agri, why=why)
+
+
+# 종합소득세 기본세율 (2023년 귀속부터) — (과세표준 상한 원, 세율, 누진공제 원)
+INCOME_TAX = [(14e6, 0.06, 0), (50e6, 0.15, 1_260_000), (88e6, 0.24, 5_760_000),
+              (150e6, 0.35, 15_440_000), (300e6, 0.38, 19_940_000), (500e6, 0.40, 25_940_000),
+              (1e9, 0.42, 35_940_000), (float("inf"), 0.45, 65_940_000)]
+
+
+def progressive_tax(base: float) -> float:
+    if base <= 0:
+        return 0.0
+    for upper, rate, ded in INCOME_TAX:
+        if base <= upper:
+            return base * rate - ded
+    return 0.0
+
+
+def loan_schedule(principal: float, annual_rate: float, months: int, method: str) -> dict:
+    r = annual_rate / 100 / 12
+    if months <= 0 or principal <= 0:
+        return dict(first=0, total_interest=0)
+    if method == "만기일시":
+        return dict(first=principal * r, total_interest=principal * r * months)
+    if method == "원금균등":
+        interest = sum((principal - principal / months * i) * r for i in range(months))
+        return dict(first=principal / months + principal * r, total_interest=interest)
+    pay = principal / months if r == 0 else principal * r / (1 - (1 + r) ** -months)
+    return dict(first=pay, total_interest=pay * months - principal)
+
+
 # ───────────────────────── 차트 ─────────────────────────
 
 def bin_chart(dist: pd.Series, highlight=None, height=200):
@@ -673,9 +752,10 @@ components.html("""<script>
       t.addEventListener('click', () => localStorage.setItem(KEY, t.innerText.trim())); } }); }, 1000);
 })();
 </script>""", height=0)
-report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None, "ck": None}
+report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None, "ck": None,
+          "calc": None}
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["동네 프로필", "비교사례", "예상 매도가", "건물 정보", "임장 체크"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["동네 프로필", "비교사례", "예상 매도가", "건물 정보", "임장 체크", "계산기"])
 
 # ── 동네 프로필
 with tab1:
@@ -1097,6 +1177,161 @@ with tab5:
     st.caption("체크한 항목은 새로고침해도 유지되고, 리셋하면 지워집니다. 인쇄 보고서에도 들어갑니다.")
     report["ck"] = dict(focus=focus, done=ss.ck_done)
 
+# ── 계산기 (네이버 부동산 계산기 참고)
+with tab6:
+    ss = st.session_state
+    r_est = report.get("est") or {}
+    # 처음 열 때 이 물건 값으로 채우고, 이후에는 주소창에 저장된 값을 씀
+    c_defaults = {
+        "c_kind": "경매 수익", "c_amt": max(0, int(r_est.get("sell", 10000))), "c_dep": 5000, "c_rent": 50,
+        "c_deal": "매매", "c_rate": 0.0, "c_vat": False, "c_ptype": "주택",
+        "c_price": max(0, int(r_est.get("bid", min_bid) or min_bid)), "c_houses": 1, "c_adj": False,
+        "c_over85": area_m2 > 85, "c_corp": False, "c_low": False,
+        "c_loan": 0, "c_irate": 4.5, "c_months": 6, "c_method": "원리금균등",
+        "c_bid": max(0, int(r_est.get("bid", min_bid) or min_bid)),
+        "c_sell": max(0, int(r_est.get("sell", min_bid * 1.4))),
+        "c_repair": int(ss.get("w_rp", 500)), "c_evict": 100, "c_etc": 100,
+        "c_taxmode": "매매사업자(종합소득세)",
+    }
+    for k, d in c_defaults.items():
+        if k not in ss:
+            raw = qp.get(k)
+            try:
+                ss[k] = (raw == "1" if isinstance(d, bool) else type(d)(float(raw)) if isinstance(d, (int, float))
+                         else raw) if raw is not None else d
+            except (TypeError, ValueError):
+                ss[k] = d
+
+    kinds = ["경매 수익", "중개보수", "취득세", "대출 이자"]
+    if ss.c_kind not in kinds:
+        ss.c_kind = kinds[0]
+    st.radio("계산기", kinds, key="c_kind", horizontal=True, label_visibility="collapsed")
+    st.caption("법정 상한·세율 기준 어림값입니다. 실제 금액은 감면·특례·협의에 따라 달라지니 계약·신고 전에 꼭 확인하세요.")
+
+    if ss.c_kind == "중개보수":
+        st.radio("거래 종류", ["매매", "전세", "월세"], key="c_deal", horizontal=True)
+        if ss.c_ptype not in ("주택", "주택 외(상가·토지 등)"):
+            ss.c_ptype = "주택"
+        st.radio("매물 종류", ["주택", "주택 외(상가·토지 등)"], key="c_ptype", horizontal=True)
+        if ss.c_deal == "월세":
+            a1, a2 = st.columns(2)
+            a1.number_input("보증금 (만원)", 0, 1_000_000, step=500, key="c_dep")
+            a2.number_input("월세 (만원)", 0, 10_000, step=5, key="c_rent")
+            amount = monthly_rent_base(ss.c_dep * 1e4, ss.c_rent * 1e4)
+            st.caption(f"환산 거래금액 {won(amount / 1e4)} (보증금 + 월세×100, 5천만 원 미만이면 ×70)")
+        else:
+            st.number_input("거래금액 (만원)", 0, 10_000_000, step=500, key="c_amt")
+            amount = ss.c_amt * 1e4
+        b1, b2 = st.columns(2)
+        b1.number_input("협의 요율 % (0이면 상한요율)", 0.0, 0.9, step=0.05, key="c_rate", format="%.2f")
+        b2.checkbox("부가세 10% 포함 (일반과세자 중개사)", key="c_vat")
+        if ss.c_ptype == "주택":
+            fee, rate, cap = brokerage_fee(amount, FEE_SALE if ss.c_deal == "매매" else FEE_LEASE)
+        else:
+            fee, rate, cap = amount * 0.009, 0.009, None
+        if ss.c_rate > 0:
+            fee = amount * min(ss.c_rate / 100, rate) if ss.c_ptype == "주택" else amount * ss.c_rate / 100
+            if cap:
+                fee = min(fee, cap)
+        vat = fee * 0.1 if ss.c_vat else 0
+        m1, m2 = st.columns(2)
+        m1.metric("중개보수 (1인 부담)", f"{fee + vat:,.0f}원")
+        m2.metric("상한요율", f"{rate * 100:.1f}%" + (f" · 한도 {cap:,.0f}원" if cap else ""))
+        st.caption("매매는 매도인·매수인이, 임대차는 임대인·임차인이 각자 부담합니다. 주택 외 부동산은 0.9% 이내에서 협의합니다.")
+
+    elif ss.c_kind == "취득세":
+        st.number_input("취득가액 (만원)", 0, 10_000_000, step=100, key="c_price")
+        a1, a2 = st.columns(2)
+        a1.number_input("취득 후 주택 수", 1, 10, key="c_houses")
+        a2.checkbox("조정대상지역", key="c_adj")
+        a3, a4 = st.columns(2)
+        a3.checkbox("전용 85㎡ 초과", key="c_over85")
+        a4.checkbox("법인 취득", key="c_corp")
+        st.checkbox("시가표준액(공시가격) 1억 원 이하 주택 → 중과 제외", key="c_low",
+                    help="정비구역 등으로 지정된 곳의 주택은 제외될 수 있습니다.")
+        t = acq_tax(ss.c_price * 1e4, ss.c_houses, ss.c_adj, ss.c_over85, ss.c_corp, ss.c_low)
+        st.metric("총 납부액", f"{t['total']:,.0f}원", f"합계 세율 {t['total_rate']:.2f}%", delta_color="off")
+        st.table(pd.DataFrame([
+            ("취득세", f"{t['rate']:.2f}%", f"{t['tax']:,.0f}원"),
+            ("지방교육세", f"{t['edu']:.2f}%", f"{t['edu_tax']:,.0f}원"),
+            ("농어촌특별세", f"{t['agri']:.2f}%", f"{t['agri_tax']:,.0f}원"),
+        ], columns=["세목", "세율", "금액"]).set_index("세목"))
+        st.caption(f"적용: {t['why']}. 일시적 2주택·생애최초 감면 등 특례는 반영하지 않았습니다.")
+
+    elif ss.c_kind == "대출 이자":
+        st.number_input("대출금 (만원)", 0, 10_000_000, step=500, key="c_loan")
+        a1, a2 = st.columns(2)
+        a1.number_input("연 금리 %", 0.0, 30.0, step=0.1, key="c_irate", format="%.2f")
+        a2.number_input("기간 (개월)", 1, 480, key="c_months")
+        if ss.c_method not in ("원리금균등", "원금균등", "만기일시"):
+            ss.c_method = "원리금균등"
+        st.radio("상환 방식", ["원리금균등", "원금균등", "만기일시"], key="c_method", horizontal=True)
+        ln = loan_schedule(ss.c_loan * 1e4, ss.c_irate, ss.c_months, ss.c_method)
+        m1, m2 = st.columns(2)
+        m1.metric("첫 달 납입액", f"{ln['first']:,.0f}원")
+        m2.metric("총 이자", f"{ln['total_interest']:,.0f}원")
+        st.caption("경매 단기 보유라면 만기일시(이자만 납부)로 보유 개월 수만큼 넣어 이자 비용을 가늠하세요.")
+
+    else:  # 경매 수익
+        st.caption("예상 매도가 탭의 값으로 처음 채워집니다. 값을 바꾸면 그대로 기억합니다.")
+        a1, a2 = st.columns(2)
+        a1.number_input("낙찰가 (만원)", 0, 10_000_000, step=10, key="c_bid")
+        a2.number_input("예상 매도가 (만원)", 0, 10_000_000, step=10, key="c_sell")
+        a3, a4, a5 = st.columns(3)
+        a3.number_input("수리비 (만원)", 0, 100_000, step=50, key="c_repair")
+        a4.number_input("명도비 (만원)", 0, 100_000, step=50, key="c_evict")
+        a5.number_input("법무사·기타 (만원)", 0, 100_000, step=10, key="c_etc")
+        b1, b2, b3 = st.columns(3)
+        b1.number_input("대출금 (만원)", 0, 10_000_000, step=500, key="c_loan")
+        b2.number_input("연 금리 %", 0.0, 30.0, step=0.1, key="c_irate", format="%.2f")
+        b3.number_input("보유 기간 (개월)", 1, 480, key="c_months")
+        c1, c2 = st.columns(2)
+        c1.number_input("취득 후 주택 수", 1, 10, key="c_houses")
+        c2.checkbox("조정대상지역", key="c_adj")
+        st.checkbox("시가표준액(공시가격) 1억 원 이하 주택 → 취득세 중과 제외", key="c_low")
+        modes = ["매매사업자(종합소득세)", "개인 양도소득세"]
+        if ss.c_taxmode not in modes:
+            ss.c_taxmode = modes[0]
+        st.radio("세금 계산", modes, key="c_taxmode", horizontal=True)
+
+        bid_w, sell_w = ss.c_bid * 1e4, ss.c_sell * 1e4
+        t = acq_tax(bid_w, ss.c_houses, ss.c_adj, area_m2 > 85, False, ss.c_low)
+        sale_fee = brokerage_fee(sell_w, FEE_SALE)[0] * 1.1      # 부가세 포함
+        interest = ss.c_loan * 1e4 * ss.c_irate / 100 / 12 * ss.c_months
+        costs = t["total"] + (ss.c_repair + ss.c_evict + ss.c_etc) * 1e4 + sale_fee + interest
+        gap = sell_w - bid_w
+        pre_tax = gap - costs
+        if ss.c_taxmode.startswith("매매사업자"):
+            tax = progressive_tax(pre_tax) * 1.1                  # 지방소득세 10% 포함
+            tax_note = "다른 소득이 없다고 보고 종합소득세 기본세율(6~45%)과 지방소득세를 적용"
+        else:
+            base = max(pre_tax - interest - 2.5e6, 0)            # 양도세는 대출이자를 필요경비로 인정 안 함
+            if ss.c_months < 12:
+                tax, tax_note = base * 0.70 * 1.1, "1년 미만 보유 주택 70% + 지방세"
+            elif ss.c_months < 24:
+                tax, tax_note = base * 0.60 * 1.1, "2년 미만 보유 주택 60% + 지방세"
+            else:
+                tax, tax_note = progressive_tax(base) * 1.1, "2년 이상 보유, 기본세율 + 지방세"
+        after = pre_tax - tax
+        own_cash = bid_w + costs - sale_fee - interest - ss.c_loan * 1e4
+        m1, m2, m3 = st.columns(3)
+        m1.metric("매매 차익 (매도가 − 낙찰가)", won(gap / 1e4))
+        m2.metric("세전 순이익", won(pre_tax / 1e4))
+        m3.metric("세후 순이익", won(after / 1e4))
+        st.table(pd.DataFrame([
+            ("취득세 등", f"{t['total']:,.0f}원 ({t['total_rate']:.2f}%, {t['why']})"),
+            ("수리·명도·기타", f"{(ss.c_repair + ss.c_evict + ss.c_etc) * 1e4:,.0f}원"),
+            ("매도 중개보수(부가세 포함)", f"{sale_fee:,.0f}원"),
+            ("대출 이자", f"{interest:,.0f}원 ({ss.c_months}개월)"),
+            ("세금", f"{tax:,.0f}원 ({tax_note})"),
+            ("필요 현금(대출 제외)", f"{own_cash:,.0f}원"),
+            ("현금 대비 세후 수익률", f"{after / own_cash * 100:.1f}%" if own_cash > 0 else "-"),
+        ], columns=["항목", "금액"]).set_index("항목"))
+        st.caption("매매사업자도 조정대상지역 다주택 등 중과 대상 주택은 양도세와 비교해 큰 쪽으로 과세될 수 있습니다(비교과세). "
+                   "정확한 세금은 세무사와 확인하세요.")
+        report["calc"] = dict(gap=gap, pre=pre_tax, after=after, tax=tax, note=tax_note,
+                              acq=t["total"], fee=sale_fee, interest=interest, cash=own_cash)
+
 
 # ───────────────────────── 인쇄용 보고서 ─────────────────────────
 
@@ -1150,6 +1385,15 @@ def build_report_html() -> str:
         if est["spread"] >= 2.0 or est["n_out"] > 0:
             parts.append(f"<div class='box warn'>평단가 편차 {est['spread']:.1f}배, 이상치 {est['n_out']}건 제외 "
                          f"(업계약 가능성 확인 필요)</div>")
+
+    cl = report.get("calc")
+    if cl:
+        parts.append(f"""<h2>경매 수익 계산 (어림)</h2><table>
+<tr><th>매매 차익</th><td>{won(cl['gap'] / 1e4)}</td><th>세전 순이익</th><td>{won(cl['pre'] / 1e4)}</td></tr>
+<tr><th>취득세 등</th><td>{cl['acq']:,.0f}원</td><th>매도 중개보수</th><td>{cl['fee']:,.0f}원</td></tr>
+<tr><th>대출 이자</th><td>{cl['interest']:,.0f}원</td><th>세금</th><td>{cl['tax']:,.0f}원</td></tr>
+<tr><th>세후 순이익</th><td><b>{won(cl['after'] / 1e4)}</b></td><th>필요 현금</th><td>{cl['cash']:,.0f}원</td></tr>
+</table><div class='box'>{e(cl['note'])}. 법정 세율 기준 어림값이며 실제 세금은 세무사와 확인하세요.</div>""")
 
     rt = report.get("route")
     if rt:
@@ -1235,6 +1479,8 @@ st.query_params.update({
     "bid": str(min_bid), "ho": ss.get("w_ho", ""), "m": str(months), "r": str(radius), "at": str(area_tol), "yt": str(age_tol),
     "dong": dong, "sel": ",".join(sorted(ss.get("sel_cur", set()))),
     "ck": ",".join(sorted(ss.get("ck_done", set()))),
+    **{k: ("1" if v else "0") if isinstance(v, bool) else str(v)
+       for k, v in ss.items() if isinstance(k, str) and k.startswith("c_")},
     "it": "1" if ss.get("w_it", True) else "0", "bk": "1" if ss.get("w_bk", True) else "0",
     "stn": str(ss.get("w_stn", 0)), "mv": "1" if ss.get("w_mv") else "0",
     "rp": str(ss.get("w_rp", 500)), "ex": str(ss.get("w_ex", 400)), "pf": str(ss.get("w_pf", 2500)),
