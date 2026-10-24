@@ -478,6 +478,7 @@ def nearby_food(kakao_key: str, lat: float, lon: float, kind: str, radius: int =
             cat = (d.get("category_name") or "").split(">")
             found.append(dict(name=d.get("place_name", ""), cat=cat[-1].strip() if cat else "",
                               dist=int(d.get("distance") or 0), phone=d.get("phone", ""),
+                              lat=float(d.get("y") or 0), lon=float(d.get("x") or 0),
                               url=d.get("place_url", ""), pick=url.endswith("keyword.json")))
     return found[:20]
 
@@ -1445,9 +1446,19 @@ with tab2:
         foods = sorted(foods, key=lambda f: f["dist"])
         fdf = pd.DataFrame([dict(이름=f["name"], 종류=f["cat"],
                                  거리=f"{f['dist']:,}m", 도보=f"약 {f['dist'] * WALK_FACTOR / WALK_M_PER_MIN:.0f}분",
+                                 지도=kakao_map_link(f["name"], f["lat"], f["lon"]) if f.get("lat") else None,
+                                 길찾기=kakao_route_link(dict(name="경매 물건" if st.session_state.w_fb == "경매 물건 주변"
+                                                             else st.session_state.w_fb, lat=flat, lon=flon),
+                                                        dict(name=f["name"], lat=f["lat"], lon=f["lon"]))
+                                 if f.get("lat") else None,
                                  전화=f["phone"], 카카오맵=f["url"]) for f in foods])
         st.dataframe(fdf, hide_index=True, use_container_width=True,
-                     column_config={"카카오맵": st.column_config.LinkColumn("후기·별점", display_text="보기")})
+                     column_order=["이름", "지도", "길찾기", "종류", "거리", "도보", "카카오맵", "전화"],
+                     column_config={
+                         "지도": st.column_config.LinkColumn("지도", display_text="위치 보기", width="small"),
+                         "길찾기": st.column_config.LinkColumn("길찾기", display_text="가는 길", width="small"),
+                         "카카오맵": st.column_config.LinkColumn("후기·별점", display_text="보기", width="small"),
+                     })
         st.caption("카카오맵 '맛집' 검색에 잡힌 곳만 가까운 순으로 보여줍니다. 별점과 후기는 '보기'를 눌러 확인하세요.")
         report["food"] = dict(base=st.session_state.w_fb, kind=st.session_state.w_fk, rows=foods[:10])
     else:
