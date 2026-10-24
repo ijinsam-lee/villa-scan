@@ -1191,7 +1191,7 @@ KAKAO_MAP_TEMPLATE = r"""
   .blue{background:#1C7ED6} .yellow{background:#FAB005} .green{background:#2F9E44}
   .ring{width:30px;height:30px;border-radius:50%;border:4px solid #E03131;background:rgba(224,49,49,.08);cursor:pointer}
   .num{background:#fff;border:2px solid #2F9E44;color:#2F9E44;font-weight:800;font-size:12px;border-radius:10px;
-       padding:0 6px;transform:translateY(-22px)}
+       padding:0 6px;pointer-events:none}
   .info{background:#fff;border:1px solid #c9d2dc;border-radius:10px;padding:8px 10px;font-size:12.5px;line-height:1.45;
         max-width:240px;box-shadow:0 2px 8px rgba(0,0,0,.2);color:#222;white-space:normal}
   .info b{font-size:13.5px} .info .btns{margin-top:6px;display:flex;gap:6px}
@@ -1263,7 +1263,8 @@ function start(){ kakao.maps.load(function(){
   D.points.forEach(pt=>{const el=document.createElement('div');el.className='dot '+(pt.sel?'yellow':'blue');
     el.style.width=el.style.height=pt.size+'px';addEl(pt,el,pt.sel?4:3);});
   (D.stops||[]).forEach(s=>{const el=document.createElement('div');el.className='num';el.textContent=s.num;
-    new kakao.maps.CustomOverlay({position:LL(s.lat,s.lon),content:el,zIndex:6}).setMap(map);});
+    // 번호표는 점 위쪽에 띄우고, 눌러도 아래 점이 반응하도록 클릭을 통과시킴
+    new kakao.maps.CustomOverlay({position:LL(s.lat,s.lon),content:el,xAnchor:.5,yAnchor:1.9,zIndex:6}).setMap(map);});
   if(D.station){const el=document.createElement('div');el.className='dot green';el.style.width=el.style.height='16px';
     addEl(D.station,el,5);}
   const t=document.createElement('div');t.className='ring';addEl(D.target,t,7);
