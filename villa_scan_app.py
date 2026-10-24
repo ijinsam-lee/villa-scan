@@ -1259,7 +1259,22 @@ function start(){ kakao.maps.load(function(){
   if(D.station){const el=document.createElement('div');el.className='dot green';el.style.width=el.style.height='16px';
     addEl(D.station,el,5);}
   const t=document.createElement('div');t.className='ring';addEl(D.target,t,7);
-  if(D.fit&&!bounds.isEmpty())map.setBounds(bounds,30,30,30,30);
+  // 스트림릿이 지도 칸 크기를 나중에 정하거나(처음 0px), 다른 메뉴에서 열었다가 돌아오면
+  // 카카오맵이 크기를 잘못 계산해 엉뚱한 곳(전국 지도)을 보여주므로, 크기가 바뀔 때마다 다시 맞춤
+  let userMoved=false;
+  kakao.maps.event.addListener(map,'dragstart',()=>{userMoved=true;});
+  kakao.maps.event.addListener(map,'zoom_start',()=>{userMoved=true;});
+  function fit(){
+    map.relayout();
+    if(userMoved)return;
+    if(D.fit&&!bounds.isEmpty())map.setBounds(bounds,30,30,30,30);
+    else map.setCenter(LL(D.target.lat,D.target.lon));
+  }
+  fit(); setTimeout(fit,250); setTimeout(fit,1000);
+  const wrapEl=document.getElementById('wrap');
+  if(window.ResizeObserver){new ResizeObserver(()=>{if(wrapEl.offsetWidth>0&&wrapEl.offsetHeight>0)fit();})
+    .observe(wrapEl);}
+  else window.addEventListener('resize',fit);
 }); }
 </script>
 """
