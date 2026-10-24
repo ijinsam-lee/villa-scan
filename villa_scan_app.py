@@ -1060,6 +1060,9 @@ def vworld_get(path: str, params: dict, domain: str):
         r = requests.get(f"https://api.vworld.kr/ned/data/{path}", params=params, timeout=20,
                          headers={"User-Agent": "Mozilla/5.0", "Referer": domain})
     except Exception as e:
+        if "RemoteDisconnected" in str(e) or "Connection aborted" in str(e) or "timed out" in str(e):
+            return None, ("브이월드가 해외 서버의 접속을 막고 있어 조회되지 않습니다"
+                          "(스트림릿 사이트는 미국 서버에서 실행됨). 컴퓨터에서 실행하면 조회됩니다")
         return None, f"연결 실패: {e}"
     try:
         return r.json(), ""
@@ -1090,6 +1093,8 @@ def fetch_land(vkey: str, domain: str, pnu: str):
         js, err = vworld_get("getLandCharacteristics", params, domain)
         if err:
             last_err = err
+            if "해외 서버" in err:
+                break
             continue
         body = next(iter(js.values()), {}) if isinstance(js, dict) else {}
         rows = body.get("field") or []
@@ -1170,6 +1175,102 @@ def target_aphus(df: pd.DataFrame, ho: str, area_m2: float) -> dict:
     return dict(year=yr, latest=latest, mine=mine, how=how, hist=hist)
 
 
+# ───────────────────────── 카카오맵 (앱 안에 표시, JavaScript 키 필요) ─────────────────────────
+
+KAKAO_MAP_TEMPLATE = r"""
+<style>
+  html,body{margin:0;padding:0;font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif}
+  #wrap{position:relative;width:100%;height:__H__px;border-radius:10px;overflow:hidden;border:1px solid #dde3ea}
+  #map,#rv{position:absolute;inset:0}
+  #rv{display:none;z-index:5;background:#000}
+  .ctl{position:absolute;z-index:6;padding:6px 10px;border-radius:8px;border:1px solid #c5daf3;background:#fff;
+       font-size:13px;font-weight:600;color:#1c4f8a;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+  #mv{left:8px;top:8px} #back{left:8px;top:8px;display:none}
+  .dot{border-radius:50%;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.35);cursor:pointer}
+  .blue{background:#1C7ED6} .yellow{background:#FAB005} .green{background:#2F9E44}
+  .ring{width:30px;height:30px;border-radius:50%;border:4px solid #E03131;background:rgba(224,49,49,.08);cursor:pointer}
+  .num{background:#fff;border:2px solid #2F9E44;color:#2F9E44;font-weight:800;font-size:12px;border-radius:10px;
+       padding:0 6px;transform:translateY(-22px)}
+  .info{background:#fff;border:1px solid #c9d2dc;border-radius:10px;padding:8px 10px;font-size:12.5px;line-height:1.45;
+        max-width:240px;box-shadow:0 2px 8px rgba(0,0,0,.2);color:#222;white-space:normal}
+  .info b{font-size:13.5px} .info .btns{margin-top:6px;display:flex;gap:6px}
+  .info button{flex:1;padding:4px 0;border-radius:6px;border:1px solid #1C7ED6;background:#1C7ED6;color:#fff;font-size:12px}
+  .info button.x{background:#fff;color:#1C7ED6}
+  #err{display:none;padding:12px;color:#c92a2a;font-size:13px}
+</style>
+<div id="wrap"><div id="map"></div><div id="rv"></div>
+  <button class="ctl" id="mv"></button><button class="ctl" id="back">← 지도로 돌아가기</button></div>
+<div id="err"></div>
+<script>
+const D = __DATA__;
+function esc(t){return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fail(m){const e=document.getElementById('err');e.style.display='block';e.textContent=m;
+  document.getElementById('wrap').style.display='none';}
+// 어디서 실행 중인지(카카오가 확인하는 주소) 보여주기 위한 정보
+function where(){let r=document.referrer||'(없음)';let a='';
+  try{a=Array.from(location.ancestorOrigins||[]).join(', ');}catch(e){}
+  return ' [확인 주소: '+r+(a?' / 상위: '+a:'')+']';}
+const sdk=document.createElement('script');
+sdk.src='https://dapi.kakao.com/v2/maps/sdk.js?appkey=__KEY__&autoload=false';
+sdk.onerror=()=>fail('카카오 지도 파일을 받지 못했습니다(인터넷 연결 또는 키 오류).'+where());
+sdk.onload=()=>{
+  if(!window.kakao||!kakao.maps){fail('카카오가 이 주소에서의 사용을 거절했습니다. JavaScript 키가 맞는지, '
+    +'JavaScript SDK 도메인에 아래 주소가 등록·저장됐는지 확인하세요.'+where());return;}
+  start();};
+document.head.appendChild(sdk);
+function start(){ kakao.maps.load(function(){
+  const LL=(a,o)=>new kakao.maps.LatLng(a,o);
+  const map=new kakao.maps.Map(document.getElementById('map'),{center:LL(D.target.lat,D.target.lon),level:3});
+  map.addControl(new kakao.maps.ZoomControl(),kakao.maps.ControlPosition.RIGHT);
+  map.addControl(new kakao.maps.MapTypeControl(),kakao.maps.ControlPosition.TOPRIGHT);
+  let movable=D.movable; const mvb=document.getElementById('mv');
+  function setMove(v){movable=v;map.setDraggable(v);map.setZoomable(v);
+    mvb.textContent=v?'🔓 지도 움직이기 켜짐':'🔒 지도 고정 (누르면 움직이기)';}
+  setMove(movable); mvb.onclick=()=>setMove(!movable);
+  const rvEl=document.getElementById('rv'), back=document.getElementById('back');
+  const rv=new kakao.maps.Roadview(rvEl), rvc=new kakao.maps.RoadviewClient();
+  function openRV(lat,lon){const p=LL(lat,lon);
+    rvc.getNearestPanoId(p,80,function(id){
+      if(id===null){alert('근처 80m 안에 로드뷰가 없습니다.');return;}
+      rvEl.style.display='block';back.style.display='block';mvb.style.display='none';
+      rv.setPanoId(id,p);setTimeout(()=>rv.relayout(),60);});}
+  back.onclick=()=>{rvEl.style.display='none';back.style.display='none';mvb.style.display='block';map.relayout();};
+  let info=null;
+  function showInfo(pt){
+    if(info)info.setMap(null);
+    const box=document.createElement('div');box.className='info';
+    box.innerHTML='<b>'+esc(pt.title)+'</b><br>'+esc(pt.label).replace(/\n/g,'<br>');
+    const btns=document.createElement('div');btns.className='btns';
+    const b1=document.createElement('button');b1.textContent='로드뷰';b1.onclick=()=>openRV(pt.lat,pt.lon);
+    const b2=document.createElement('button');b2.className='x';b2.textContent='닫기';b2.onclick=()=>{info.setMap(null);};
+    btns.appendChild(b1);btns.appendChild(b2);box.appendChild(btns);
+    info=new kakao.maps.CustomOverlay({position:LL(pt.lat,pt.lon),content:box,yAnchor:1.12,zIndex:20});
+    info.setMap(map);}
+  const bounds=new kakao.maps.LatLngBounds();
+  function addEl(pt,el,z){el.onclick=(ev)=>{ev.stopPropagation();showInfo(pt);};
+    new kakao.maps.CustomOverlay({position:LL(pt.lat,pt.lon),content:el,xAnchor:.5,yAnchor:.5,zIndex:z}).setMap(map);
+    bounds.extend(LL(pt.lat,pt.lon));}
+  (D.route||[]).length&&new kakao.maps.Polyline({map:map,path:D.route.map(p=>LL(p[0],p[1])),
+    strokeWeight:4,strokeColor:'#2F9E44',strokeOpacity:.85});
+  D.points.forEach(pt=>{const el=document.createElement('div');el.className='dot '+(pt.sel?'yellow':'blue');
+    el.style.width=el.style.height=pt.size+'px';addEl(pt,el,pt.sel?4:3);});
+  (D.stops||[]).forEach(s=>{const el=document.createElement('div');el.className='num';el.textContent=s.num;
+    new kakao.maps.CustomOverlay({position:LL(s.lat,s.lon),content:el,zIndex:6}).setMap(map);});
+  if(D.station){const el=document.createElement('div');el.className='dot green';el.style.width=el.style.height='16px';
+    addEl(D.station,el,5);}
+  const t=document.createElement('div');t.className='ring';addEl(D.target,t,7);
+  if(D.fit&&!bounds.isEmpty())map.setBounds(bounds,30,30,30,30);
+}); }
+</script>
+"""
+
+
+def kakao_map_html(js_key: str, data: dict, height: int = 400) -> str:
+    js = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return (KAKAO_MAP_TEMPLATE.replace("__KEY__", js_key.strip()).replace("__DATA__", js)
+            .replace("__H__", str(height)))
+
+
 # ───────────────────────── 차트 ─────────────────────────
 
 def bin_chart(dist: pd.Series, highlight=None, height=200):
@@ -1204,6 +1305,13 @@ st.markdown("""<style>
 html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"], [data-testid="stMain"], section.main {
   overscroll-behavior-y: contain;
 }
+/* 숫자 카드(metric) 글자를 본문과 어울리게 줄임 */
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] div {
+  font-size: 1.25rem !important; line-height: 1.4 !important; font-weight: 600 !important;
+}
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] p { font-size: 0.85rem !important; }
+[data-testid="stMetricDelta"], [data-testid="stMetricDelta"] div { font-size: 0.8rem !important; }
+[data-testid="stMetric"] { padding: 2px 0 !important; }
 /* 탭 메뉴 강조: 색 배경 + 버튼 모양, 휴대폰에서도 모든 탭이 보이도록 줄바꿈
    (스트림릿 버전마다 구조가 달라 여러 이름으로 지정) */
 [data-testid="stTabs"] [role="tablist"], div[data-baseweb="tab-list"] {
@@ -1972,15 +2080,36 @@ with tab2:
         with map_slot:
             st.markdown(f"경매 물건: {link_html(kakao_map_link('경매 물건', lat0, lon0), '카카오맵에서 보기')} · "
                         f"{link_html(kakao_roadview_link(lat0, lon0), '로드뷰')}", unsafe_allow_html=True)
-            move = st.toggle("지도 움직이기 (확대·이동)", key="w_mv",
-                             help="끄면 지도 위에서 손가락으로 화면을 스크롤할 수 있습니다.")
-            deck.views = [pdk.View(type="MapView", controller=True if move else False)]
-            try:
-                st.pydeck_chart(deck, use_container_width=True, height=380 if move else 300)
-            except TypeError:  # 구버전 streamlit
-                st.pydeck_chart(deck, use_container_width=True)
-            st.caption("빨간 테두리: 경매 물건 · 파란 점: 최근 거래(클수록 거래 많음) · 노란 점: 선택한 임장지 · "
-                       "초록: 출발역과 동선. 점을 누르면 건물명과 거래 내역이 보입니다.")
+            kjs = secret("KAKAO_JS_KEY")
+            if kjs:
+                # 카카오맵: 건물명·상가가 보이고, 점을 누르면 정보창 → '로드뷰'로 앱 안에서 바로 확인
+                kdata = {
+                    "target": {"lat": lat0, "lon": lon0, "title": "경매 물건", "label": st.session_state.addr},
+                    "points": [{"lat": float(r.lat), "lon": float(r.lon), "title": r.title,
+                                "label": r.label.split("\n", 1)[1] if "\n" in r.label else r.label,
+                                "sel": bool(r.q in sel_qs), "size": int(12 + 3 * min(r.n, 4))}
+                               for r in grouped.itertuples()],
+                    "movable": bool(st.session_state.get("w_mv", False)), "fit": True,
+                }
+                if route:
+                    kdata["route"] = [[p["lat"], p["lon"]] for p in path_pts]
+                    kdata["stops"] = [{"lat": p["lat"], "lon": p["lon"], "num": i} for i, p in enumerate(route, 1)]
+                    kdata["station"] = {"lat": station["lat"], "lon": station["lon"], "title": "출발역",
+                                        "label": station["name"]}
+                components.html(kakao_map_html(kjs, kdata, 400), height=410)
+                st.caption("빨간 원: 경매 물건 · 파란 점: 최근 거래(클수록 거래 많음) · 노란 점: 선택한 임장지 · "
+                           "초록: 출발역과 동선. 점을 누르면 정보창이 뜨고 '로드뷰'로 앱 안에서 바로 볼 수 있습니다. "
+                           "지도 왼쪽 위 버튼으로 지도를 움직일 수 있습니다.")
+            else:
+                move = st.toggle("지도 움직이기 (확대·이동)", key="w_mv",
+                                 help="끄면 지도 위에서 손가락으로 화면을 스크롤할 수 있습니다.")
+                deck.views = [pdk.View(type="MapView", controller=True if move else False)]
+                try:
+                    st.pydeck_chart(deck, use_container_width=True, height=380 if move else 300)
+                except TypeError:  # 구버전 streamlit
+                    st.pydeck_chart(deck, use_container_width=True)
+                st.caption("빨간 테두리: 경매 물건 · 파란 점: 최근 거래(클수록 거래 많음) · 노란 점: 선택한 임장지 · "
+                           "초록: 출발역과 동선. 점을 누르면 건물명과 거래 내역이 보입니다.")
 
 # ── 임장 계획: 날씨 · 맛집 (비교사례 탭 아래쪽)
 with tab2:
