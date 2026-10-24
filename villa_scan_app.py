@@ -707,6 +707,26 @@ if run or auto:
         st.query_params.pop("dong", None)
     st.session_state.update(trades=trades, lat0=lat0, lon0=lon0, addr=addr, b_code=b_code, t_jibun=t_jibun,
                             sgg=" ".join(addr.split()[:-2]))
+    if run:
+        # 시세 조회를 누르면 사이드 메뉴를 접어 결과 화면을 바로 보여줌
+        # (매번 새로 실행되도록 시각값을 넣음)
+        import time
+        components.html(f"""<script>
+(function () {{
+  // {time.time()}
+  let doc; try {{ doc = window.parent.document; }} catch (e) {{ return; }}
+  let tries = 0;
+  (function close() {{
+    const bar = doc.querySelector('section[data-testid="stSidebar"]');
+    if (bar && bar.getAttribute('aria-expanded') === 'false') return;      // 이미 접힘
+    const btn = doc.querySelector('[data-testid="stSidebarCollapseButton"] button')
+             || doc.querySelector('[data-testid="stSidebarHeader"] button')
+             || doc.querySelector('section[data-testid="stSidebar"] button[kind="headerNoPadding"]');
+    if (btn) {{ btn.click(); return; }}
+    if (++tries < 30) setTimeout(close, 100);
+  }})();
+}})();
+</script>""", height=0)
 
 if "trades" not in st.session_state:
     st.info("왼쪽에 경매 물건 정보를 입력하고 시세 조회를 누르세요.")
