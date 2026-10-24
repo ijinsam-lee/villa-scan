@@ -421,6 +421,67 @@ def nearest_place(kakao_key: str, lat: float, lon: float, params_json: str, radi
     return None
 
 
+# ───────────────────────── 임장 계획: 날씨 · 맛집 ─────────────────────────
+
+WMO = {0: ("☀️", "맑음"), 1: ("🌤", "대체로 맑음"), 2: ("⛅", "구름 조금"), 3: ("☁️", "흐림"),
+       45: ("🌫", "안개"), 48: ("🌫", "안개"), 51: ("🌦", "약한 이슬비"), 53: ("🌦", "이슬비"), 55: ("🌧", "강한 이슬비"),
+       56: ("🌧", "어는 이슬비"), 57: ("🌧", "어는 이슬비"), 61: ("🌧", "약한 비"), 63: ("🌧", "비"), 65: ("🌧", "강한 비"),
+       66: ("🌧", "어는 비"), 67: ("🌧", "어는 비"), 71: ("🌨", "약한 눈"), 73: ("🌨", "눈"), 75: ("❄️", "강한 눈"),
+       77: ("🌨", "싸락눈"), 80: ("🌦", "소나기"), 81: ("🌧", "소나기"), 82: ("⛈", "강한 소나기"),
+       85: ("🌨", "눈 소나기"), 86: ("❄️", "강한 눈 소나기"), 95: ("⛈", "뇌우"), 96: ("⛈", "뇌우·우박"), 99: ("⛈", "뇌우·우박")}
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fetch_weather(lat: float, lon: float):
+    """Open-Meteo 7일 예보 (키 필요 없음)"""
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": lat, "longitude": lon, "timezone": "Asia/Seoul", "forecast_days": 7,
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                     "precipitation_probability_max,precipitation_sum,wind_speed_10m_max"}, timeout=10)
+        d = r.json()["daily"]
+    except Exception as e:
+        return str(e)
+    out = []
+    for i, day in enumerate(d["time"]):
+        code = int(d["weather_code"][i] or 0)
+        icon, desc = WMO.get(code, ("🌡", "-"))
+        pop = d["precipitation_probability_max"][i]
+        rain = d["precipitation_sum"][i] or 0
+        wind = (d["wind_speed_10m_max"][i] or 0) / 3.6          # km/h → m/s
+        tmax, tmin = d["temperature_2m_max"][i], d["temperature_2m_min"][i]
+        good = (pop is None or pop < 30) and rain < 1 and code < 51 and wind < 9 and -5 <= (tmax or 0) <= 32
+        out.append(dict(date=day, icon=icon, desc=desc, tmax=tmax, tmin=tmin, pop=pop, rain=rain,
+                        wind=wind, good=good))
+    return out
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def nearby_food(kakao_key: str, lat: float, lon: float, kind: str, radius: int = 1000) -> list[dict]:
+    """카카오맵 '맛집'('카페') 검색에 잡힌 곳만 (가까운 아무 가게는 넣지 않음)"""
+    code = "FD6" if kind == "음식점" else "CE7"
+    head = {"Authorization": f"KakaoAK {kakao_key.strip()}"}
+    found, seen = [], set()
+    calls = [("https://dapi.kakao.com/v2/local/search/keyword.json",
+              {"query": "맛집" if kind == "음식점" else "카페 맛집", "category_group_code": code,
+               "sort": "accuracy"})]
+    for url, p in calls:
+        try:
+            docs = requests.get(url, params={**p, "x": lon, "y": lat, "radius": radius, "size": 15},
+                                headers=head, timeout=10).json().get("documents", [])
+        except Exception:
+            continue
+        for d in docs:
+            if d.get("id") in seen:
+                continue
+            seen.add(d.get("id"))
+            cat = (d.get("category_name") or "").split(">")
+            found.append(dict(name=d.get("place_name", ""), cat=cat[-1].strip() if cat else "",
+                              dist=int(d.get("distance") or 0), phone=d.get("phone", ""),
+                              url=d.get("place_url", ""), pick=url.endswith("keyword.json")))
+    return found[:20]
+
+
 # ───────────────────────── 임장 동선 ─────────────────────────
 
 WALK_FACTOR = 1.3      # 직선거리 → 실제 걸음거리 보정
@@ -873,6 +934,8 @@ for k, v in {
     "w_bk": qp.get("bk", "1") == "1",
     "w_stn": qnum("stn", 0, 0, 4),
     "w_mv": qp.get("mv", "0") == "1",
+    "w_fk": qp.get("fk", "음식점"),
+    "w_fb": qp.get("fb", "경매 물건 주변"),
     "sel_cur": set(filter(None, qp.get("sel", "").split(","))),
     "ck_done": set(filter(None, qp.get("ck", "").split(","))),
 }.items():
@@ -1039,7 +1102,7 @@ components.html("""<script>
 })();
 </script>""", height=0)
 report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None, "ck": None,
-          "calc": None, "rent": None, "loc": None}
+          "calc": None, "rent": None, "loc": None, "weather": None, "food": None}
 
 with st.expander("📘 앱 전체 사용법"):
     st.markdown(GUIDE_ALL)
@@ -1333,6 +1396,63 @@ with tab2:
                 st.pydeck_chart(deck, use_container_width=True)
             st.caption("빨간 테두리: 경매 물건 · 파란 점: 최근 거래(클수록 거래 많음) · 노란 점: 선택한 임장지 · "
                        "초록: 출발역과 동선. 점을 누르면 건물명과 거래 내역이 보입니다.")
+
+# ── 임장 계획: 날씨 · 맛집 (비교사례 탭 아래쪽)
+with tab2:
+    st.markdown("#### 임장 계획: 날씨 · 식사")
+    wx = fetch_weather(round(lat0, 3), round(lon0, 3))
+    if isinstance(wx, str) or not wx:
+        st.info("날씨를 불러오지 못했습니다. 잠시 후 다시 열어 보세요.")
+    else:
+        wdays = ["월", "화", "수", "목", "금", "토", "일"]
+        # 휴대폰에서도 한 줄로 보이도록 가로 스크롤 카드
+        cards = []
+        for w in wx:
+            d = pd.Timestamp(w["date"])
+            pop = w["pop"] if w["pop"] is not None else "-"
+            cards.append(
+                f"<div style='flex:0 0 78px;text-align:center;padding:6px 2px;border-radius:10px;"
+                f"background:{'#e6f4ea' if w['good'] else '#f6f7f9'};color:#222;font-size:13px;line-height:1.35'>"
+                f"<b>{d.month}/{d.day}({wdays[d.weekday()]})</b><br><span style='font-size:22px'>{w['icon']}</span><br>"
+                f"{w['desc']}<br>{w['tmax']:.0f}° / {w['tmin']:.0f}°<br>☔ {pop}%{'<br>👍' if w['good'] else ''}</div>")
+        st.markdown("<div style='display:flex;gap:6px;overflow-x:auto;padding-bottom:4px'>"
+                    + "".join(cards) + "</div>", unsafe_allow_html=True)
+        good_days = [f"{pd.Timestamp(w['date']).month}/{pd.Timestamp(w['date']).day}"
+                     f"({wdays[pd.Timestamp(w['date']).weekday()]})" for w in wx if w["good"]]
+        st.caption(("임장하기 좋은 날(👍, 초록): " + ", ".join(good_days) + ". ") if good_days else
+                   "이번 주는 비·바람 등으로 임장하기 좋은 날이 없습니다. ")
+        st.caption("👍 기준: 강수확률 30% 미만, 비 거의 없음, 바람 초속 9m 미만, 기온 −5–32°. Open-Meteo 예보(경매 물건 위치 기준).")
+        report["weather"] = wx
+
+    route_now, station_now = globals().get("route"), globals().get("station")
+    bases = ["경매 물건 주변"] + (["출발역 주변", "임장 동선 중간"] if route_now and station_now else [])
+    if st.session_state.get("w_fb") not in bases:
+        st.session_state["w_fb"] = bases[0]
+    if st.session_state.get("w_fk") not in ("음식점", "카페"):
+        st.session_state["w_fk"] = "음식점"
+    f1, f2 = st.columns(2)
+    f1.radio("찾을 곳", ["음식점", "카페"], key="w_fk", horizontal=True)
+    f2.selectbox("기준 위치", bases, key="w_fb")
+    if st.session_state.w_fb == "출발역 주변":
+        flat, flon = station_now["lat"], station_now["lon"]
+    elif st.session_state.w_fb == "임장 동선 중간":
+        flat = sum(p["lat"] for p in route_now) / len(route_now)
+        flon = sum(p["lon"] for p in route_now) / len(route_now)
+    else:
+        flat, flon = lat0, lon0
+    foods = nearby_food(kakao_key, round(flat, 4), round(flon, 4), st.session_state.w_fk)
+    if foods:
+        foods = sorted(foods, key=lambda f: f["dist"])
+        fdf = pd.DataFrame([dict(이름=f["name"], 종류=f["cat"],
+                                 거리=f"{f['dist']:,}m", 도보=f"약 {f['dist'] * WALK_FACTOR / WALK_M_PER_MIN:.0f}분",
+                                 전화=f["phone"], 카카오맵=f["url"]) for f in foods])
+        st.dataframe(fdf, hide_index=True, use_container_width=True,
+                     column_config={"카카오맵": st.column_config.LinkColumn("후기·별점", display_text="보기")})
+        st.caption("카카오맵 '맛집' 검색에 잡힌 곳만 가까운 순으로 보여줍니다. 별점과 후기는 '보기'를 눌러 확인하세요.")
+        report["food"] = dict(base=st.session_state.w_fb, kind=st.session_state.w_fk, rows=foods[:10])
+    else:
+        st.info("1km 안에 카카오맵 맛집으로 잡힌 곳이 없습니다. 기준 위치를 바꿔 보세요.")
+
 
 # ── 예상 매도가
 with tab3:
@@ -1912,6 +2032,24 @@ def build_report_html() -> str:
                          f"<th>월세 수익률</th><td>{yld}</td></tr>")
         parts.append("</table>")
 
+    wx_r = report.get("weather")
+    if wx_r:
+        wd = ["월", "화", "수", "목", "금", "토", "일"]
+        parts.append("<h2>임장 날씨 (7일)</h2><table><tr>" + "".join(
+            f"<th>{pd.Timestamp(w['date']).month}/{pd.Timestamp(w['date']).day}"
+            f"({wd[pd.Timestamp(w['date']).weekday()]})</th>" for w in wx_r) + "</tr><tr>" + "".join(
+            f"<td style='text-align:center'>{w['icon']} {e(w['desc'])}<br>{w['tmax']:.0f}°/{w['tmin']:.0f}°<br>"
+            f"☔{w['pop'] if w['pop'] is not None else '-'}%{' 👍' if w['good'] else ''}</td>" for w in wx_r)
+            + "</tr></table>")
+    fd = report.get("food")
+    if fd:
+        parts.append(f"<h2>식사·휴식 ({e(fd['base'])} {e(fd['kind'])})</h2><table>"
+                     "<tr><th>이름</th><th>종류</th><th>거리</th><th>전화</th></tr>")
+        for f in fd["rows"]:
+            parts.append(f"<tr><td>{e(f['name'])}</td><td>{e(f['cat'])}</td>"
+                         f"<td class='num'>{f['dist']:,}m</td><td>{e(f['phone'])}</td></tr>")
+        parts.append("</table>")
+
     lc = report.get("loc")
     if lc:
         parts.append("<h2>입지</h2><table><tr><th>시설</th><th>이름</th><th>거리</th><th>도보</th><th>매수층</th></tr>")
@@ -2026,6 +2164,7 @@ st.query_params.update({
        for k, v in ss.items() if isinstance(k, str) and k.startswith("c_")},
     "it": "1" if ss.get("w_it", True) else "0", "bk": "1" if ss.get("w_bk", True) else "0",
     "stn": str(ss.get("w_stn", 0)), "mv": "1" if ss.get("w_mv") else "0",
+    "fk": ss.get("w_fk", "음식점"), "fb": ss.get("w_fb", "경매 물건 주변"),
     "rp": str(ss.get("w_rp", 500)), "ex": str(ss.get("w_ex", 400)), "pf": str(ss.get("w_pf", 2500)),
     **({"ppy": str(ss["w_ppy"])} if "w_ppy" in ss else {}),
 })
