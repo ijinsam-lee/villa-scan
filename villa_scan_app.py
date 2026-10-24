@@ -537,9 +537,10 @@ def plan_route(start: dict, stops: list[dict], back: bool) -> list[dict]:
 
 
 def link_html(url: str, text: str) -> str:
-    """같은 창(앱 전체 화면)에서 열리는 링크. 휴대폰 '뒤로가기'로 앱에 돌아오면 보던 화면이 복원됨"""
+    """새 탭으로 열리는 링크 (스트림릿 사이트 보안상 같은 창 이동은 막혀 있음)"""
     from html import escape
-    return f"<a href='{escape(url, quote=True)}' target='_top'>{escape(text)}</a>" if url else ""
+    return (f"<a href='{escape(url, quote=True)}' target='_blank' rel='noopener'>{escape(text)}</a>"
+            if url else "")
 
 
 def html_table(rows: list[dict], links: dict | None = None) -> str:
@@ -1359,7 +1360,8 @@ with tab2:
                  "_map": kakao_map_link(n, a_, o_), "_rv": kakao_roadview_link(a_, o_)}
                 for n, d, a_, o_ in zip(blds["name"], blds["dist_m"], blds["lat"], blds["lon"])],
                 links={"지도": ("_map", "카카오맵"), "로드뷰": ("_rv", "보기")}), unsafe_allow_html=True)
-            st.caption("링크는 같은 창에서 열립니다. 다 본 뒤 휴대폰 '뒤로가기'를 누르면 이 화면으로 돌아옵니다.")
+            st.caption("링크는 새 탭으로 열립니다. 다 본 뒤 카카오맵 탭에서 '뒤로가기'로 탭을 닫거나, "
+                       "크롬 위쪽 숫자(탭) 버튼에서 streamlit.app 탭을 고르면 이 화면으로 돌아옵니다.")
         sel_rows = [i for i, v in enumerate(edited["임장"].tolist()) if v]
         st.session_state.sel_cur = {ids[i] for i in sel_rows}
         sel_qs = list(dict.fromkeys(comps.loc[sel_rows, "q"]))  # 같은 건물 여러 거래는 한 곳으로
