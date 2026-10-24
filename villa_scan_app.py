@@ -536,7 +536,10 @@ def tmap_walk(app_key: str, a_lat: float, a_lon: float, b_lat: float, b_lon: flo
     feats = js.get("features") or []
     if not feats:
         err = js.get("error") or {}
-        raise TmapError(err.get("message") or err.get("code") or f"HTTP {r.status_code}")
+        code = str(err.get("code") or "")
+        hint = {"INVALID_API_KEY": "앱키가 틀림 — 대시보드에서 다시 복사",
+                "QUOTA_EXCEEDED": "오늘 무료 사용량 초과"}.get(code.upper(), "")
+        raise TmapError(" / ".join(x for x in (f"HTTP {r.status_code}", code, err.get("message"), hint) if x))
     prop = feats[0].get("properties", {})
     dist, sec = prop.get("totalDistance"), prop.get("totalTime")
     if dist is None or sec is None:
