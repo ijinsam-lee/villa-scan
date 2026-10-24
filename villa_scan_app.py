@@ -1054,6 +1054,20 @@ def offset(lat: float, lon: float, dist_m: float, bearing_deg: float):
 VW_DOMAIN_DEFAULT = "https://villa-scan.streamlit.app"
 
 
+def vworld_get(path: str, params: dict, domain: str):
+    """브이월드 호출 → (dict, 오류문구). 브라우저처럼 요청해야 응답하는 경우가 있어 헤더를 붙임"""
+    try:
+        r = requests.get(f"https://api.vworld.kr/ned/data/{path}", params=params, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0", "Referer": domain})
+    except Exception as e:
+        return None, f"연결 실패: {e}"
+    try:
+        return r.json(), ""
+    except ValueError:
+        txt = " ".join(r.text.split())[:160]
+        return None, f"응답 형식 오류(HTTP {r.status_code}): {txt}"
+
+
 def make_pnu(b_code: str, jibun: str) -> str:
     """법정동코드10 + 산여부(1 일반, 2 산) + 본번4 + 부번4"""
     jb = (jibun or "").strip()
@@ -1073,10 +1087,9 @@ def fetch_land(vkey: str, domain: str, pnu: str):
         params = {"key": vkey.strip(), "domain": domain, "pnu": pnu, "format": "json", "numOfRows": 100, "pageNo": 1}
         if y:
             params["stdrYear"] = y
-        try:
-            js = requests.get("https://api.vworld.kr/ned/data/getLandCharacteristics", params=params, timeout=15).json()
-        except Exception as e:
-            last_err = f"연결 실패: {e}"
+        js, err = vworld_get("getLandCharacteristics", params, domain)
+        if err:
+            last_err = err
             continue
         body = next(iter(js.values()), {}) if isinstance(js, dict) else {}
         rows = body.get("field") or []
@@ -1115,12 +1128,11 @@ def fetch_aphus(vkey: str, domain: str, pnu: str):
     """이 지번 공동주택의 연도별·호별 공시가격 전체. 실패하면 오류 문자열"""
     rows, page = [], 1
     while page <= 10:
-        try:
-            js = requests.get("https://api.vworld.kr/ned/data/getApartHousingPriceAttr", params={
-                "key": vkey.strip(), "domain": domain, "pnu": pnu, "format": "json",
-                "numOfRows": 1000, "pageNo": page}, timeout=20).json()
-        except Exception as e:
-            return f"연결 실패: {e}"
+        js, err = vworld_get("getApartHousingPriceAttr", {
+            "key": vkey.strip(), "domain": domain, "pnu": pnu, "format": "json",
+            "numOfRows": 1000, "pageNo": page}, domain)
+        if err:
+            return err
         body = next(iter(js.values()), {}) if isinstance(js, dict) else {}
         chunk = body.get("field") or []
         if isinstance(chunk, dict):
@@ -1332,14 +1344,19 @@ with st.sidebar:
         st.session_state["w_mode"] = "물건 분석"
     st.radio("모드", ["물건 분석", "지역 찾기"], key="w_mode", horizontal=True,
              help="지역 찾기: 구를 고르면 빌라 거래가 활발한 동을 순위로 보여줍니다.")
-    st.subheader("API 키")
-    data_key = st.text_input("공공데이터포털 인증키", type="password",
-                             value=secret("DATA_GO_KR_KEY"))
-    kakao_key = st.text_input("카카오 REST API 키", type="password",
-                              value=secret("KAKAO_REST_KEY"))
-    vworld_key = st.text_input("브이월드 인증키 (선택)", type="password", value=secret("VWORLD_KEY"),
-                               help="넣으면 건물·입지 탭에 지형높이·도로접면·용도지역·공시지가가 나옵니다.")
+    # API 키는 secrets.toml(또는 스트림릿 Secrets)에 있으면 화면에 보이지 않음. 빠진 키만 입력칸을 보여줌
+    data_key, kakao_key, vworld_key = secret("DATA_GO_KR_KEY"), secret("KAKAO_REST_KEY"), secret("VWORLD_KEY")
     vworld_domain = secret("VWORLD_DOMAIN") or VW_DOMAIN_DEFAULT
+    if not (data_key and kakao_key and vworld_key):
+        with st.expander("API 키 설정", expanded=not (data_key and kakao_key)):
+            if not data_key:
+                data_key = st.text_input("공공데이터포털 인증키", type="password")
+            if not kakao_key:
+                kakao_key = st.text_input("카카오 REST API 키", type="password")
+            if not vworld_key:
+                vworld_key = st.text_input("브이월드 인증키 (선택)", type="password",
+                                           help="넣으면 공시가격·지형높이·도로접면·용도지역·공시지가가 나옵니다.")
+            st.caption("secrets.toml에 넣어 두면 이 칸은 사라집니다.")
 
     st.subheader("경매 물건")
     addr = st.text_input("주소 (지번 주소 권장)", key="w_addr",
@@ -1680,6 +1697,7 @@ if vworld_key and _pnu:
                                high=aph.get("high"), cap=aph.get("cap"), n=len(aph["mine"]))
     elif isinstance(_ap, str):
         aph = {"error": _ap}
+        fetch_aphus.clear()   # 실패 결과는 기억하지 않고 다음에 다시 시도
 
 # ── 동네 프로필
 with tab1:
@@ -2319,6 +2337,7 @@ with tab4:
         land = fetch_land(vworld_key, vworld_domain, pnu)
         if isinstance(land, str):
             st.caption(f"브이월드 토지특성 조회 실패: {land}")
+            fetch_land.clear()   # 실패 결과는 기억하지 않고 다음에 다시 시도
             land = None
     if land:
         hg = land.get("tpgrphHgCodeNm", "-")
