@@ -575,6 +575,19 @@ st.markdown("""<style>
 html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"], [data-testid="stMain"], section.main {
   overscroll-behavior-y: contain;
 }
+/* 탭 메뉴 강조: 색 배경 + 버튼 모양, 휴대폰에서도 모든 탭이 보이도록 줄바꿈 */
+div[data-baseweb="tab-list"] {
+  flex-wrap: wrap; gap: 6px; padding: 8px; border-radius: 12px;
+  background: #e7f0fb; border: 1px solid #c5daf3;
+}
+button[data-baseweb="tab"] {
+  padding: 6px 14px !important; margin: 0 !important; height: auto !important;
+  border-radius: 999px; background: #ffffff; border: 1px solid #c5daf3;
+}
+button[data-baseweb="tab"] p { color: #1c4f8a; font-weight: 600; font-size: 15px; }
+button[data-baseweb="tab"][aria-selected="true"] { background: #1C7ED6; border-color: #1C7ED6; }
+button[data-baseweb="tab"][aria-selected="true"] p { color: #ffffff; }
+div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display: none; }
 </style>""", unsafe_allow_html=True)
 
 # 조회 조건을 주소창(URL)에 저장 → 새로고침돼도 같은 조건으로 자동 재조회
