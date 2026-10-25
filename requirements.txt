@@ -3,3 +3,4 @@ pandas
 requests
 pydeck
 altair
+pypdf
