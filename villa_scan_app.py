@@ -1049,16 +1049,19 @@ def rank_dongs(trades: pd.DataFrame, rents: pd.DataFrame, min_n: int) -> pd.Data
 GUIDE_REGION = """
 **왜 보나요?** 빌라는 **팔리는 동네**에서 사야 합니다. 같은 구 안에서도 동마다 거래량과 분위기가 크게 다릅니다.
 
-**읽는 법**
-- **점수**(100점) = 거래량 40% + 시장 추세 20% + 전세가율 20% + 시세 안정성 20%
-- **거래**: 예산·평수 조건에 맞는 최근 거래 건수입니다. 많을수록 내 물건도 팔기 쉽습니다.
+##### 읽는 법
+- **순위**는 **거래 건수**만으로 매깁니다(같으면 거래가 늘어나는 동 먼저). 많이 팔리는 동일수록 내 물건도 팔기 쉽습니다.
+- **거래**: 예산·평수 조건에 맞는 최근 12개월 거래 건수입니다.
+- **지도**: 거래 하나하나를 건물 위치에 점으로 찍습니다. 큰길·역에서 어느 쪽에 거래가 몰리는지 봅니다.
 - **거래 추세·가격 추세**: 최근 3개월을 직전 3개월과 비교합니다(이번 달 제외).
 - **전세가율**: 70% 근처를 가장 높게 칩니다. 너무 높으면 역전세 위험, 너무 낮으면 전세로 회수가 어렵습니다.
 - **시세 안정**: 평단가가 고르게 분포할수록 '높음'입니다. '낮음'이면 업계약·시세 왜곡을 조심하세요.
 
-**활용 순서**: 마음에 드는 동을 고르고 **'이 동 분석하기'**를 누르면 그 동의 동네 프로필(잘 팔리는 유형)로 넘어갑니다.
+##### 활용 순서
+마음에 드는 동을 고르고 **'이 동 분석하기'**를 누르면 그 동의 동네 프로필(잘 팔리는 유형)로 넘어갑니다.
 
-**한계**: 경매 낙찰가율·경쟁률·경매 낙찰자 매물 비율은 자료가 없어 반영하지 않았습니다.
+##### 한계
+경매 낙찰가율·경쟁률·경매 낙찰자 매물 비율은 자료가 없어 반영하지 않았습니다.
 """
 
 
@@ -1398,6 +1401,9 @@ KAKAO_MAP_TEMPLATE = r"""
 <div id="err"></div>
 <script>
 const D = __DATA__;
+// 지역 찾기처럼 경매 물건이 없는 지도: 원들의 가운데를 중심으로 쓰고 빨간 고리는 숨김
+if(!D.target){const cs=(D.circles||[]).concat(D.points||[]);D.hideTarget=true;
+  D.target={lat:cs.reduce((a,c)=>a+c.lat,0)/(cs.length||1),lon:cs.reduce((a,c)=>a+c.lon,0)/(cs.length||1),title:'',label:''};}
 function esc(t){return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fail(m){const e=document.getElementById('err');e.style.display='block';e.textContent=m;
   document.getElementById('wrap').style.display='none';}
@@ -1458,7 +1464,8 @@ function start(){ kakao.maps.load(function(){
       strokeWeight:2,strokeColor:'#1C7ED6',strokeOpacity:.9,fillOpacity:0});
     const rb=rc.getBounds();bounds.extend(rb.getSouthWest());bounds.extend(rb.getNorthEast());}
   (D.circles||[]).forEach(c=>{const ci=new kakao.maps.Circle({map:map,center:LL(c.lat,c.lon),radius:c.r,
-      strokeWeight:1,strokeColor:'#E03131',strokeOpacity:.6,fillColor:'#E03131',fillOpacity:c.op});
+      strokeWeight:1,strokeColor:c.color||'#E03131',strokeOpacity:.7,fillColor:c.color||'#E03131',fillOpacity:c.op});
+    if(D.hideTarget){const cb=ci.getBounds();bounds.extend(cb.getSouthWest());bounds.extend(cb.getNorthEast());}
     kakao.maps.event.addListener(ci,'click',()=>showInfo(c));});
   (D.route||[]).length&&new kakao.maps.Polyline({map:map,path:D.route.map(p=>LL(p[0],p[1])),
     strokeWeight:4,strokeColor:'#2F9E44',strokeOpacity:.85});
@@ -1469,7 +1476,7 @@ function start(){ kakao.maps.load(function(){
     new kakao.maps.CustomOverlay({position:LL(s.lat,s.lon),content:el,xAnchor:.5,yAnchor:1.9,zIndex:6}).setMap(map);});
   if(D.station){const el=document.createElement('div');el.className='dot green';el.style.width=el.style.height='16px';
     addEl(D.station,el,5);}
-  const t=document.createElement('div');t.className='ring';addEl(D.target,t,7);
+  if(!D.hideTarget){const t=document.createElement('div');t.className='ring';addEl(D.target,t,7);}
   // 스트림릿이 지도 칸 크기를 나중에 정하거나(처음 0px), 다른 메뉴에서 열었다가 돌아오면
   // 카카오맵이 크기를 잘못 계산해 엉뚱한 곳(전국 지도)을 보여주므로, 크기가 바뀔 때마다 다시 맞춤
   // 지도가 안 보이는 탭에 있을 때(크기 0) 맞추면 전국·해외 지도로 튀므로 그때는 건너뜀.
@@ -1637,6 +1644,11 @@ for k, v in {
     "ck_done": set(filter(None, qp.get("ck", "").split(","))),
 }.items():
     st.session_state.setdefault(k, v)
+# 모드를 바꾸면 안 보이는 입력칸의 값이 지워지지 않게 다시 넣어 둠 (스트림릿은 화면에 없는 입력칸 값을 버림)
+for k in ("w_addr", "w_area", "w_year", "w_floor", "w_bid", "w_ho", "w_m", "w_r", "w_at", "w_yt",
+          "rf_sel", "rf_pmin", "rf_pmax", "rf_amin", "rf_amax", "rf_minn", "rf_rent"):
+    if k in st.session_state:
+        st.session_state[k] = st.session_state[k]
 if "ppy" in qp and "w_ppy" not in st.session_state:
     st.session_state["w_ppy"] = qnum("ppy", 1000, 0, 100000)
 
@@ -1719,6 +1731,35 @@ with st.sidebar:
                                            help="넣으면 공시가격·지형높이·도로접면·용도지역·공시지가가 나옵니다.")
             st.caption("secrets.toml에 넣어 두면 이 칸은 사라집니다.")
 
+    region_mode = st.session_state.get("w_mode") == "지역 찾기"
+    if region_mode:
+        # 지역 찾기: 경매 물건·조회 조건 대신 지역·예산·평수만 보여줌
+        ss_ = st.session_state
+        st.subheader("찾을 지역")
+        options = [f"{sd} {g}" for sd, gs in REGIONS.items() for g in gs]
+        ss_.rf_sel = [x for x in ss_.rf_sel if x in options]
+        st.multiselect("구 (여러 개 가능, 3개 이하 권장)", options, key="rf_sel", placeholder="예: 서울 구로구")
+        st.subheader("조건")
+        c1, c2 = st.columns(2)
+        c1.number_input("매매가 최소 (만원)", 0, 200000, step=1000, key="rf_pmin")
+        c2.number_input("매매가 최대 (만원)", 0, 200000, step=1000, key="rf_pmax")
+        c3, c4 = st.columns(2)
+        c3.number_input("전용평수 최소", 0, 60, key="rf_amin")
+        c4.number_input("전용평수 최대", 0, 60, key="rf_amax")
+        st.number_input("동별 최소 거래 건수", 1, 50, key="rf_minn")
+        st.checkbox("전세가율 포함", key="rf_rent", help="전월세 API가 승인되어 있어야 합니다.")
+        st.caption("물건 분석으로 돌아가면 입력해 둔 경매 물건 정보가 그대로 있습니다.")
+        run = False
+        addr = st.session_state.get("w_addr", "")
+        area_m2, build_year = st.session_state.get("w_area", 42.0), st.session_state.get("w_year", 1990)
+        floor, min_bid, ho_in = st.session_state.get("w_floor", 2), st.session_state.get("w_bid", 0), ""
+        months, radius = st.session_state.get("w_m", 12), st.session_state.get("w_r", 300)
+        area_tol, age_tol = st.session_state.get("w_at", 3), st.session_state.get("w_yt", 5)
+        st.button("처음부터 다시 (리셋)", on_click=reset_all, use_container_width=True,
+                  help="입력값, 선택한 임장지, 조정한 값을 모두 지우고 새로 시작합니다.")
+
+if not region_mode:
+  with st.sidebar:
     st.subheader("경매 물건")
     addr = st.text_input("주소 (지번 주소 권장)", key="w_addr",
                          help="예: 경기도 부천시 오정구 고강동 123-4")
@@ -1762,27 +1803,13 @@ if st.session_state.get("w_mode") == "지역 찾기" and not run:
         st.error("왼쪽 메뉴에 API 키 두 개를 넣어 주세요.")
         st.stop()
 
-    options = [f"{sd} {g}" for sd, gs in REGIONS.items() for g in gs]
-    ss.rf_sel = [x for x in ss.rf_sel if x in options]
-    st.multiselect("지역 (여러 개 선택 가능, 3개 이하 권장)", options, key="rf_sel",
-                   placeholder="예: 서울 구로구")
-    with st.expander("조건 (예산·평수)", expanded=False):
-        c1, c2 = st.columns(2)
-        c1.number_input("매매가 최소 (만원)", 0, 200000, step=1000, key="rf_pmin")
-        c2.number_input("매매가 최대 (만원)", 0, 200000, step=1000, key="rf_pmax")
-        c3, c4 = st.columns(2)
-        c3.number_input("전용평수 최소", 0, 60, key="rf_amin")
-        c4.number_input("전용평수 최대", 0, 60, key="rf_amax")
-        c5, c6 = st.columns(2)
-        c5.number_input("동별 최소 거래 건수", 1, 50, key="rf_minn")
-        c6.checkbox("전세가율 포함", key="rf_rent", help="전월세 API가 승인되어 있어야 합니다.")
     st.query_params.update({
         "mode": "지역 찾기", "rf": "|".join(ss.rf_sel), "rfp0": str(ss.rf_pmin), "rfp1": str(ss.rf_pmax),
         "rfa0": str(ss.rf_amin), "rfa1": str(ss.rf_amax), "rfn": str(ss.rf_minn),
         "rfj": "1" if ss.rf_rent else "0"})
 
     if not ss.rf_sel:
-        st.info("위에서 지역(구)을 고르면 그 안의 동을 순위로 보여줍니다.")
+        st.info("왼쪽 메뉴에서 지역(구)을 고르면 그 안의 동을 순위로 보여줍니다.")
         st.stop()
 
     trs, rts, info, fails = [], [], {}, []
@@ -1841,6 +1868,8 @@ if st.session_state.get("w_mode") == "지역 찾기" and not run:
     if rk.empty:
         st.warning("조건에 맞는 동이 없습니다. 예산·평수 범위를 넓히거나 최소 거래 건수를 낮춰 보세요.")
         st.stop()
+    # 순위는 거래량만으로 (같으면 거래 추세가 좋은 동 먼저)
+    rk = rk.sort_values(["n", "c_chg"], ascending=False).reset_index(drop=True)
 
     def arrow(v, unit="%"):
         return f"▲{v:.0f}{unit}" if v >= 5 else f"▼{abs(v):.0f}{unit}" if v <= -5 else "–"
@@ -1849,7 +1878,7 @@ if st.session_state.get("w_mode") == "지역 찾기" and not run:
              f"최근 12개월 · 동 **{len(rk)}곳**")
     table = pd.DataFrame({
         "순위": range(1, len(rk) + 1),
-        "지역": rk["region"], "동": rk["dong"], "점수": rk["score"].astype(int),
+        "지역": rk["region"], "동": rk["dong"],
         "거래": rk["n"], "거래 추세": rk["c_chg"].map(arrow),
         "가격 추세": rk["p_chg"].map(lambda v: f"▲{v:.1f}%" if v >= 1 else f"▼{abs(v):.1f}%" if v <= -1 else "–"),
         "중앙 매매가": rk["price"].map(won), "평단가(만)": rk["ppy"].round(0).fillna(0).astype(int),
@@ -1864,12 +1893,44 @@ if st.session_state.get("w_mode") == "지역 찾기" and not run:
     rk["lat"] = [(geo_d.get(q) or [None])[0] for q in qs]
     rk["lon"] = [(geo_d.get(q) or [None, None])[1] for q in qs]
     mp = rk.dropna(subset=["lat", "lon"]).copy()
-    if len(mp):
+    kjs_r = secret("KAKAO_JS_KEY")
+    if kjs_r:
+        # 카카오맵: 조건에 맞는 거래를 건물마다 점으로 찍음(클수록 거래 많음). 숫자는 동 순위(10위까지, 점들의 가운데)
+        top = rk.assign(rank=range(1, len(rk) + 1))
+        Tm = T.merge(top[["region", "dong", "rank"]], on=["region", "dong"])
+        Tm["q"] = [f"{info[r]['full']} {d} {j}" for r, d, j in zip(Tm["region"], Tm["dong"], Tm["jibun"])]
+        with st.spinner(f"거래 {len(Tm)}건의 위치 찾는 중 (처음 한 번만 오래 걸림)"):
+            geo_t = geocode_many(kakao_key, Tm["q"].drop_duplicates().tolist())
+        Tm["lat"] = [(geo_t.get(q) or [None])[0] for q in Tm["q"]]
+        Tm["lon"] = [(geo_t.get(q) or [None, None])[1] for q in Tm["q"]]
+        Tm = Tm.dropna(subset=["lat", "lon"])
+        pts_r = []
+        for (q, rnk, dname), g in Tm.sort_values("deal_date", ascending=False).groupby(["q", "rank", "dong"], sort=False):
+            lines = [f"{d:%y.%m} {won(pr)} · {a:.1f}평" + ("" if pd.isna(fl) else f" · {fl:.0f}층")
+                     for d, pr, a, fl in zip(g["deal_date"], g["price"], g["area_py"], g["floor"]) if pd.notna(d)][:5]
+            pts_r.append({"lat": float(g["lat"].iloc[0]), "lon": float(g["lon"].iloc[0]),
+                          "title": f"{(g['name'].iloc[0] or '이름 없음')} ({dname} {g['jibun'].iloc[0]})",
+                          "label": f"{rnk}위 동 · 거래 {len(g)}건\n" + "\n".join(lines),
+                          "sel": False, "size": int(9 + 3 * min(len(g), 4))})
+        cen = Tm.groupby("rank")[["lat", "lon"]].median()
+        rdata = {
+            "points": pts_r, "fit": True, "movable": False,
+            "stops": [{"lat": float(r.lat), "lon": float(r.lon), "num": int(k)}
+                      for k, r in cen.iterrows() if k <= 10],
+        }
+        if pts_r:
+            components.html(kakao_map_html(kjs_r, rdata, 480), height=490)
+            st.caption(f"파란 점: 조건에 맞는 거래 {len(Tm)}건(건물 {len(pts_r)}곳, 클수록 같은 건물 거래 많음) · "
+                       "초록 숫자: 동 순위(그 동 거래들의 가운데). 점을 누르면 건물명과 최근 거래가 보입니다. "
+                       "왼쪽 위 버튼으로 지도를 움직일 수 있습니다.")
+        else:
+            st.info("거래 위치를 찾지 못했습니다.")
+    elif len(mp):
         import pydeck as pdk
         mp["color"] = [[47, 158, 68, 190] if c >= 5 else [224, 49, 49, 170] if c <= -5 else [134, 142, 150, 170]
                        for c in mp["c_chg"]]
         mp["radius"] = (mp["n"] / mp["n"].max() * 600 + 150).astype(float)
-        mp["label"] = [f"{i + 1}위 {r} {d}\n점수 {sc:.0f} · 거래 {n}건\n평단가 {p:,.0f}만"
+        mp["label"] = [f"{i + 1}위 {r} {d}\n거래 {n}건\n평단가 {p:,.0f}만"
                        for i, (r, d, sc, n, p) in enumerate(zip(mp["region"], mp["dong"], mp["score"],
                                                                  mp["n"], mp["ppy"]))]
         span = max(mp["lat"].max() - mp["lat"].min(), (mp["lon"].max() - mp["lon"].min()) * 0.8)
@@ -1885,7 +1946,7 @@ if st.session_state.get("w_mode") == "지역 찾기" and not run:
 
     st.markdown("#### 이 동 분석하기")
     pick = st.selectbox("동 선택", range(len(rk)),
-                        format_func=lambda i: f"{i + 1}위 · {rk['region'][i]} {rk['dong'][i]} (점수 {rk['score'][i]:.0f})")
+                        format_func=lambda i: f"{i + 1}위 · {rk['region'][i]} {rk['dong'][i]} (거래 {rk['n'][i]}건)")
     st.button("이 동의 동네 프로필 보기 →", type="primary", use_container_width=True, on_click=_analyze_dong,
               args=(info[rk["region"][pick]]["full"], rk["dong"][pick]))
     st.caption("넘어가면 그 동에서 잘 팔리는 빌라 유형을 볼 수 있습니다. 실제 물건을 볼 때는 지번 주소를 넣어 다시 조회하세요.")
