@@ -14,6 +14,7 @@
 """
 
 import hashlib
+from html import escape as _e
 import json
 import math
 import os
@@ -249,10 +250,12 @@ def price_estimate(comps: pd.DataFrame) -> dict:
 def won(manwon: float) -> str:
     if manwon is None or pd.isna(manwon):
         return "-"
-    eok, man = divmod(int(round(manwon)), 10000)
+    v = int(round(manwon))
+    sign, v = ("-" if v < 0 else ""), abs(v)       # 음수도 '-1억 2,022만'처럼 바르게 (전에는 -7,978만이 이렇게 잘못 나옴)
+    eok, man = divmod(v, 10000)
     if eok and man:
-        return f"{eok}억 {man:,}만"
-    return f"{eok}억" if eok else f"{man:,}만"
+        return f"{sign}{eok}억 {man:,}만"
+    return f"{sign}{eok}억" if eok else f"{sign}{man:,}만"
 
 
 # ───────────────────────── 동·호수 추정 (건축물대장 전유부) ─────────────────────────
@@ -1117,6 +1120,44 @@ def slope_label(pct: float) -> str:
     return "평지" if a < 3 else "완만" if a < 8 else "가파름" if a < 12 else "매우 가파름"
 
 
+# 경사 등급: 0 평지 · 1 완만 · 2 경사 · 3 급경사
+SLOPE_LV = [("🟢", "평지"), ("🟡", "완만"), ("🟠", "경사"), ("🔴", "급경사")]
+SLOPE_VERDICT = [
+    "경사 걱정 없는 곳입니다. 노인·유모차 가구도 편하게 다닐 수 있습니다.",
+    "약간 경사가 있지만 대부분 가구에 무리 없는 수준입니다.",
+    "경사진 동네입니다. 노인·유모차 가구는 꺼릴 수 있어 매수·임차 수요가 줄어듭니다. 직접 걸어 보세요.",
+    "경사가 심합니다. 찾는 사람이 적어 팔거나 세 놓기 어려울 수 있으니, 그만큼 낮게 입찰해야 합니다.",
+]
+HG_LEVEL = {"저지": 0, "평지": 0, "완경사": 1, "급경사": 3, "고지": 3}
+SLOPE_GUIDE = """
+경사는 **집을 찾는 사람의 폭**을 정합니다. 언덕이 심하면 노인·유모차 가구가 빠져 팔거나 세 놓기가 어렵습니다.
+
+- **맨 위 색 판정**이 결론입니다: 🟢 평지 · 🟡 완만 · 🟠 경사 · 🔴 급경사 (아래 세 칸 중 가장 나쁜 것 기준)
+- **동네 전체**: 물건 주변 300m를 어느 쪽으로 걸어도 평균 몇 % 오르내리는지. 동네가 언덕 동네인지 봅니다.
+- **물건 자리**: 물건 바로 양옆 150m의 높이 차이와, 공시지가 조사 때 필지마다 정한 공식 지형 분류(평지·완경사·급경사·고지).
+- **걸어올 때**: 역·정류장·학교에서 집까지 오르막인지, 가장 가파른 곳이 얼마나 되는지. 장 보고 오는 길이 오르막이면 체감이 큽니다.
+
+경사 % 감: 3% 미만 평지 · 3–6% 살짝 · 6–10% 숨이 참 · 10% 이상 유모차·노인 힘듦 (걷는 길은 8% 이상이면 가파름)
+"""
+
+
+def slope_grade(pct: float, walk: bool = False) -> int:
+    """경사 %를 0–3 등급으로. 걷는 길의 '가장 가파른 곳'은 짧은 구간이라 기준을 높게 잡음"""
+    a = abs(pct)
+    cuts = (3, 8, 12) if walk else (3, 6, 10)
+    return 0 if a < cuts[0] else 1 if a < cuts[1] else 2 if a < cuts[2] else 3
+
+
+def slope_card(title: str, lv: int, body: str) -> str:
+    colors = ["#2F9E44", "#E8A400", "#F76707", "#E03131"]
+    icon, name = SLOPE_LV[lv]
+    return (f"<div style='border:1px solid #e3e8ef;border-left:6px solid {colors[lv]};border-radius:10px;"
+            f"padding:10px 14px;margin:4px 0 10px 0'>"
+            f"<div style='font-size:13px;color:#667'>{title}</div>"
+            f"<div style='font-size:20px;font-weight:700;margin:2px 0 4px 0'>{icon} {name}</div>"
+            f"<div style='font-size:13.5px;line-height:1.6'>{body}</div></div>")
+
+
 def offset(lat: float, lon: float, dist_m: float, bearing_deg: float):
     b = math.radians(bearing_deg)
     return (lat + dist_m * math.cos(b) / 111_000,
@@ -1201,6 +1242,34 @@ def road_help(name: str) -> str:
 
 GUARANTEE_RATE = 1.26   # 전세보증보험 전세금 한도 ≈ 공시가격 × 140% × 전세가율 90% (기준은 바뀔 수 있음)
 
+APHUS_GUIDE = """
+빌라 경매에서 공시가격은 **시세 그 자체보다 '전세를 얼마나 받을 수 있나'와 '세금'을 정하는 기준**으로 더 중요합니다.
+
+**1. 전세 상한 (가장 중요)**
+빌라 세입자는 대부분 HUG 전세보증보험 가입을 조건으로 겁니다. 보험이 되는 전세금이 사실상 그 집 전세가의 상한입니다.
+현재 기준은 대략 **공시가격 × 126%** (공시가격의 140%를 집값으로 보고 그 90%까지).
+예) 공시가격 1억 6천 → 전세 상한 약 2억 160만. 시세가 2억 5천이어도 전세는 2억까지만 받기 쉽습니다.
+낙찰 후 전세로 투자금을 돌려받을 계획이면 **입찰가 정하기 전에 이 금액부터** 보세요. 보증 기준은 자주 바뀌니 입찰 전 HUG에서 최신 기준을 확인하세요.
+
+**2. 세금**
+- 취득세: 공시가격 **1억 이하** 주택은 다주택자여도 취득세 중과에서 빠집니다(1.1%, 정비구역 등 예외). 계산기에 자동 반영됩니다.
+- 재산세·종부세도 공시가격 기준이라 보유 비용을 따질 때 씁니다. 세금은 세무사 확인을 권합니다.
+
+**3. 감정가 점검**
+감정가가 공시가격보다 지나치게 높으면 감정가가 부풀려졌을 수 있습니다. "최저가가 싸 보이는" 함정에 주의하세요.
+
+**4. 시세 보정 (같은 건물 비율)**
+같은 건물 다른 호실이 실제로 팔린 가격 ÷ 그 호실의 공시가격 비율을 구해, 이 물건 공시가격에 곱하면 시세를 추정할 수 있습니다.
+거래가 드문 빌라에서 '예상 매도가'를 검증하는 데 좋습니다. 근거 거래가 1–2건이면 참고만 하세요.
+
+| 용도 | 계산 | 판단 |
+|---|---|---|
+| 전세 상한 | 공시가 × 126% | 낙찰 후 전세로 회수할 수 있는 금액 |
+| 취득세 | 1억 이하인지 | 다주택 중과를 피할 수 있는지 |
+| 감정가 점검 | 감정가 ÷ 공시가 | 감정가가 부풀려졌는지 |
+| 시세 보정 | 같은 건물 실거래 ÷ 공시가 | 예상 매도가 검증 |
+"""
+
 
 @st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
 def fetch_aphus(vkey: str, domain: str, pnu: str):
@@ -1249,6 +1318,39 @@ def target_aphus(df: pd.DataFrame, ho: str, area_m2: float) -> dict:
     return dict(year=yr, latest=latest, mine=mine, how=how, hist=hist)
 
 
+def ho_floor(h: str):
+    """호수 → 층 (302→3, 1201→12, B01·지01→-1). 알 수 없으면 None"""
+    h = norm_ho(h)
+    if h[:1] in ("B", "지"):
+        return -1
+    d = "".join(ch for ch in h if ch.isdigit())
+    return int(d[:-2]) if len(d) >= 3 else None
+
+
+def same_bld_ratio(ap_df: pd.DataFrame, same: pd.DataFrame) -> list[dict]:
+    """같은 건물 실거래 ↔ 그 해 공시가격(같은 면적·층 호실) 짝짓기 → 실거래가 ÷ 공시가격"""
+    years = sorted(ap_df["year"].dropna().astype(int).unique())
+    floors = ap_df["ho"].map(ho_floor)
+    out = []
+    for t in same.itertuples():
+        if not years or pd.isna(t.year):
+            continue
+        yr = min(years, key=lambda y: (abs(y - int(t.year)), -y))   # 거래한 해(없으면 가까운 해)
+        c = ap_df[(ap_df["year"] == yr) & ((ap_df["area"] - t.area_m2).abs() <= 0.5)]
+        if c.empty:
+            continue
+        if pd.notna(t.floor):
+            cf = c[floors.loc[c.index] == int(t.floor)]
+            c = cf if len(cf) else c
+        pub = float(c["price"].median())
+        if pub <= 0:
+            continue
+        out.append(dict(date=f"{int(t.year)}.{int(t.month):02d}", floor=t.floor, area=t.area_m2,
+                        price=float(t.price), pub=pub, pub_year=yr, ratio=float(t.price) * 1e4 / pub,
+                        hos=", ".join(sorted(set(c["ho"])))[:30]))
+    return out
+
+
 # ───────────────────────── 카카오맵 (앱 안에 표시, JavaScript 키 필요) ─────────────────────────
 
 KAKAO_MAP_TEMPLATE = r"""
@@ -1260,7 +1362,7 @@ KAKAO_MAP_TEMPLATE = r"""
   #rv{width:100%;height:100%}
   .ctl{position:absolute;z-index:6;padding:6px 10px;border-radius:8px;border:1px solid #c5daf3;background:#fff;
        font-size:13px;font-weight:600;color:#1c4f8a;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.15)}
-  #mv{left:8px;top:8px} #back{left:8px;top:8px;display:none}
+  #mv{left:8px;top:8px} #back{left:8px;top:8px;display:none} #home{left:8px;top:46px}
   .dot{border-radius:50%;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.35);cursor:pointer}
   .blue{background:#1C7ED6} .yellow{background:#FAB005} .green{background:#2F9E44}
   .ring{width:30px;height:30px;border-radius:50%;border:4px solid #E03131;background:rgba(224,49,49,.08);cursor:pointer}
@@ -1274,7 +1376,8 @@ KAKAO_MAP_TEMPLATE = r"""
   #err{display:none;padding:12px;color:#c92a2a;font-size:13px}
 </style>
 <div id="wrap"><div id="map"></div><div id="rvbox"><div id="rv"></div></div>
-  <button class="ctl" id="mv"></button><button class="ctl" id="back">← 지도로 돌아가기</button></div>
+  <button class="ctl" id="mv"></button><button class="ctl" id="back">← 지도로 돌아가기</button>
+  <button class="ctl" id="home">📍 처음 위치로</button></div>
 <div id="err"></div>
 <script>
 const D = __DATA__;
@@ -1295,7 +1398,7 @@ sdk.onload=()=>{
 document.head.appendChild(sdk);
 function start(){ kakao.maps.load(function(){
   const LL=(a,o)=>new kakao.maps.LatLng(a,o);
-  const map=new kakao.maps.Map(document.getElementById('map'),{center:LL(D.target.lat,D.target.lon),level:3});
+  const map=new kakao.maps.Map(document.getElementById('map'),{center:LL(D.target.lat,D.target.lon),level:D.level||3});
   map.addControl(new kakao.maps.ZoomControl(),kakao.maps.ControlPosition.RIGHT);
   map.addControl(new kakao.maps.MapTypeControl(),kakao.maps.ControlPosition.TOPRIGHT);
   let movable=D.movable; const mvb=document.getElementById('mv');
@@ -1308,11 +1411,12 @@ function start(){ kakao.maps.load(function(){
     rvc.getNearestPanoId(p,80,function(id){
       if(id===null){alert('근처 80m 안에 로드뷰가 없습니다.');return;}
       if(info)info.setMap(null);
-      rvBox.style.display='block';back.style.display='block';mvb.style.display='none';
+      rvBox.style.display='block';back.style.display='block';mvb.style.display='none';document.getElementById('home').style.display='none';
       // 로드뷰는 보이는 상태에서 만들어야 크기를 제대로 잡음
       setTimeout(()=>{ if(!rv)rv=new kakao.maps.Roadview(document.getElementById('rv'));
         rv.setPanoId(id,p); rv.relayout(); },30);});}
-  back.onclick=()=>{rvBox.style.display='none';back.style.display='none';mvb.style.display='block';map.relayout();};
+  back.onclick=()=>{rvBox.style.display='none';back.style.display='none';mvb.style.display='block';
+    document.getElementById('home').style.display='block';map.relayout();};
   let info=null;
   function showInfo(pt){
     if(info)info.setMap(null);
@@ -1332,6 +1436,13 @@ function start(){ kakao.maps.load(function(){
   function addEl(pt,el,z){el.onclick=(ev)=>{ev.stopPropagation();showInfo(pt);};
     new kakao.maps.CustomOverlay({position:LL(pt.lat,pt.lon),content:el,xAnchor:.5,yAnchor:.5,zIndex:z}).setMap(map);
     bounds.extend(LL(pt.lat,pt.lon));}
+  // 생활권: 반경 원(파랑) + 점포 밀집 원(빨강, 클수록·진할수록 많음). 누르면 정보창
+  if(D.ring){const rc=new kakao.maps.Circle({map:map,center:LL(D.ring.lat,D.ring.lon),radius:D.ring.r,
+      strokeWeight:2,strokeColor:'#1C7ED6',strokeOpacity:.9,fillOpacity:0});
+    const rb=rc.getBounds();bounds.extend(rb.getSouthWest());bounds.extend(rb.getNorthEast());}
+  (D.circles||[]).forEach(c=>{const ci=new kakao.maps.Circle({map:map,center:LL(c.lat,c.lon),radius:c.r,
+      strokeWeight:1,strokeColor:'#E03131',strokeOpacity:.6,fillColor:'#E03131',fillOpacity:c.op});
+    kakao.maps.event.addListener(ci,'click',()=>showInfo(c));});
   (D.route||[]).length&&new kakao.maps.Polyline({map:map,path:D.route.map(p=>LL(p[0],p[1])),
     strokeWeight:4,strokeColor:'#2F9E44',strokeOpacity:.85});
   D.points.forEach(pt=>{const el=document.createElement('div');el.className='dot '+(pt.sel?'yellow':'blue');
@@ -1344,17 +1455,27 @@ function start(){ kakao.maps.load(function(){
   const t=document.createElement('div');t.className='ring';addEl(D.target,t,7);
   // 스트림릿이 지도 칸 크기를 나중에 정하거나(처음 0px), 다른 메뉴에서 열었다가 돌아오면
   // 카카오맵이 크기를 잘못 계산해 엉뚱한 곳(전국 지도)을 보여주므로, 크기가 바뀔 때마다 다시 맞춤
-  let userMoved=false;
-  kakao.maps.event.addListener(map,'dragstart',()=>{userMoved=true;});
-  kakao.maps.event.addListener(map,'zoom_start',()=>{userMoved=true;});
-  function fit(){
-    map.relayout();
-    if(userMoved)return;
-    if(D.fit&&!bounds.isEmpty())map.setBounds(bounds,30,30,30,30);
-    else map.setCenter(LL(D.target.lat,D.target.lon));
-  }
-  fit(); setTimeout(fit,250); setTimeout(fit,1000);
+  // 지도가 안 보이는 탭에 있을 때(크기 0) 맞추면 전국·해외 지도로 튀므로 그때는 건너뜀.
+  // 프로그램이 맞추며 생긴 확대/축소는 '사용자가 움직임'으로 치지 않음
+  let userMoved=false, fitting=false;
   const wrapEl=document.getElementById('wrap');
+  kakao.maps.event.addListener(map,'dragstart',()=>{userMoved=true;});
+  kakao.maps.event.addListener(map,'zoom_start',()=>{if(!fitting)userMoved=true;});
+  function place(){
+    fitting=true;
+    map.relayout();
+    if(D.fit&&!bounds.isEmpty())map.setBounds(bounds,30,30,30,30);
+    else {map.setLevel(D.level||3);map.setCenter(LL(D.target.lat,D.target.lon));}
+    setTimeout(()=>{fitting=false;},400);
+  }
+  function fit(){
+    if(!(wrapEl.offsetWidth>0&&wrapEl.offsetHeight>0))return;
+    if(userMoved){map.relayout();return;}
+    place();
+  }
+  const home=document.getElementById('home');
+  home.onclick=()=>{userMoved=false;place();};
+  fit(); setTimeout(fit,250); setTimeout(fit,1000);
   if(window.ResizeObserver){new ResizeObserver(()=>{if(wrapEl.offsetWidth>0&&wrapEl.offsetHeight>0)fit();})
     .observe(wrapEl);}
   else window.addEventListener('resize',fit);
@@ -1402,6 +1523,10 @@ st.caption("이 동네에서 실제로 팔리는 빌라인지, 얼마에 팔 수
 st.markdown("""<style>
 html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"], [data-testid="stMain"], section.main {
   overscroll-behavior-y: contain;
+}
+/* 소제목(####, 예: '생활권: 주변 상가') 위 여백을 기본의 약 3배로 → 칸 구분이 잘 보이게 */
+[data-testid="stMarkdownContainer"] h4, [data-testid="stHeading"] h4 {
+  padding-top: 2.25rem !important; margin-top: 2rem !important;
 }
 /* 숫자 카드(metric) 글자를 본문과 어울리게 줄임 */
 [data-testid="stMetricValue"], [data-testid="stMetricValue"] div {
@@ -1899,8 +2024,24 @@ if vworld_key and _pnu:
             aph["low"] = aph["mine"]["price"].min()
             aph["high"] = aph["mine"]["price"].max()
             aph["cap"] = aph["price"] * GUARANTEE_RATE
+            # 같은 건물 다른 호실 실거래 ÷ 그 호실 공시가격 → 이 물건 공시가격에 곱해 시세 추정
+            _tr = st.session_state.get("trades")
+            if isinstance(_tr, pd.DataFrame) and not _tr.empty:
+                def _nj(j):
+                    j = str(j).strip()
+                    return j[:-2] if j.endswith("-0") else j
+                _addr = st.session_state.get("addr", "")
+                _same = _tr[(_tr["jibun"].map(_nj) == _nj(st.session_state.get("t_jibun", "")))
+                            & _tr["dong"].map(lambda d: bool(d) and str(d) in _addr)]
+                aph["same"] = same_bld_ratio(_ap, _same) if len(_same) else []
+                if aph["same"]:
+                    _rs = pd.Series([x["ratio"] for x in aph["same"]])
+                    aph["ratio"] = float(_rs.median())
+                    aph["ratio_lo"], aph["ratio_hi"] = float(_rs.min()), float(_rs.max())
+                    aph["bld_est"] = aph["ratio"] * aph["price"] / 1e4      # 만원
         report["aphus"] = dict(year=aph["year"], how=aph["how"], price=aph.get("price"), low=aph.get("low"),
-                               high=aph.get("high"), cap=aph.get("cap"), n=len(aph["mine"]))
+                               high=aph.get("high"), cap=aph.get("cap"), n=len(aph["mine"]),
+                               bld_est=aph.get("bld_est"), ratio=aph.get("ratio"), n_same=len(aph.get("same") or []))
     elif isinstance(_ap, str):
         aph = {"error": _ap}
         fetch_aphus.clear()   # 실패 결과는 기억하지 않고 다음에 다시 시도
@@ -2537,6 +2678,8 @@ with tab4:
 # ── 지형·경사 (건물·입지 탭, 입지 위)
 with tab4:
     st.markdown("#### 공시가격 (공동주택)")
+    with st.expander("📖 공시가격을 경매에서 쓰는 법"):
+        st.markdown(APHUS_GUIDE)
     if not vworld_key:
         st.caption("브이월드 키를 넣으면 호실별 공시가격이 나옵니다.")
     elif aph is None:
@@ -2556,6 +2699,23 @@ with tab4:
                       help="공시가격 1억 이하 주택은 다주택 취득세 중과에서 빠집니다(정비구역 등 예외).")
             a3.metric("전세보증보험 한도", won(aph["cap"] / 1e4), help="공시가격 × 140% × 90% ≈ 126%. 기준은 바뀔 수 있습니다.")
             st.caption(f"{aph['how']}: {hos}{rng_txt}")
+            if aph.get("bld_est"):
+                b1, b2_, b3 = st.columns(3)
+                b1.metric("같은 건물 비율로 본 시세", won(aph["bld_est"]),
+                          help="같은 건물 다른 호실의 실거래가 ÷ 그 호실 공시가격(거래한 해) 비율의 중앙값 × 이 물건 공시가격")
+                b2_.metric("실거래가 ÷ 공시가격", f"{aph['ratio']:.2f}배",
+                           f"범위 {aph['ratio_lo']:.2f}–{aph['ratio_hi']:.2f}배", delta_color="off")
+                b3.metric("근거 거래", f"{len(aph['same'])}건")
+                with st.expander("같은 건물 거래와 공시가격 비교"):
+                    st.dataframe(pd.DataFrame([{
+                        "거래": x["date"], "층": "" if pd.isna(x["floor"]) else int(x["floor"]),
+                        "전용(㎡)": x["area"], "실거래가": won(x["price"]),
+                        f"공시가격": f"{won(x['pub'] / 1e4)} ({x['pub_year']}년)", "비율": f"{x['ratio']:.2f}배",
+                        "짝지은 호실": x["hos"]} for x in aph["same"]]), hide_index=True, use_container_width=True)
+                    st.caption("층·면적이 같은 호실의 공시가격과 짝지었습니다. 거래가 1–2건뿐이면 참고만 하세요.")
+            elif aph.get("same") is not None:
+                st.caption("조회 기간 안에 같은 건물 거래가 없어 공시가격 비율로 시세를 추정하지 못했습니다. "
+                           "왼쪽 메뉴에서 조회 기간을 늘리면 찾을 수도 있습니다.")
             est_ = report.get("est") or {}
             if est_.get("sell"):
                 st.caption(f"예상 매도가는 공시가격의 **{est_['sell'] * 1e4 / p * 100:.0f}%** 수준입니다. "
@@ -2576,6 +2736,9 @@ with tab4:
                 "공시가격": lt["price"].map(lambda v: won(v / 1e4))}), hide_index=True, use_container_width=True)
 
     st.markdown("#### 지형·경사")
+    with st.expander("📖 이 칸 보는 법"):
+        st.markdown(SLOPE_GUIDE)
+    # 공식 토지특성(브이월드): 지형높이는 경사 판단에, 나머지는 아래 '토지 정보'에 씀
     land = None
     pnu = make_pnu(st.session_state.get("b_code", ""), st.session_state.get("t_jibun", ""))
     if vworld_key and pnu:
@@ -2584,40 +2747,15 @@ with tab4:
             st.caption(f"브이월드 토지특성 조회 실패: {land}")
             fetch_land.clear()   # 실패 결과는 기억하지 않고 다음에 다시 시도
             land = None
-    if land:
-        hg = land.get("tpgrphHgCodeNm", "-")
-        rs = land.get("roadSideCodeNm", "-")
-        price_m2 = to_num(land.get("pblntfPclnd"))
-        l1, l2, l3 = st.columns(3)
-        l1.metric("지형높이 (공식)", hg, help="개별공시지가 조사 때 필지마다 분류한 값: 저지·평지·완경사·급경사·고지")
-        l2.metric("도로 접면", rs, help=road_help(rs))
-        l3.metric("용도지역", land.get("prposArea1Nm", "-"))
-        l4, l5, l6 = st.columns(3)
-        l4.metric("공시지가", f"{price_m2 / 1e4:,.0f}만/㎡", f"평당 {price_m2 * PYEONG / 1e4:,.0f}만", delta_color="off")
-        l5.metric("대지면적", f"{to_num(land.get('lndpclAr')):,.1f}㎡")
-        l6.metric("지형 형상", land.get("tpgrphFrmCodeNm", "-"))
-        land_note = f"{land.get('stdrYear', '')}년 기준 · 이용상황 {land.get('ladUseSittnNm', '-')} · 도로: {road_help(rs)}"
-        # 세대당 대지지분 추정 (건축물대장 표제부의 대지면적 ÷ 세대수)
-        tl = expos_store().get(("title", st.session_state.get("b_code", ""), st.session_state.get("t_jibun", "")))
-        if isinstance(tl, list) and tl:
-            hh = max(to_num(tl[0].get("hhldCnt")), to_num(tl[0].get("hoCnt")))
-            if hh:
-                share = to_num(land.get("lndpclAr")) / hh
-                land_note += (f" · 세대당 대지지분 약 {share:.1f}㎡({share / PYEONG:.1f}평) → "
-                              f"공시지가 기준 땅값 약 {won(share * price_m2 / 1e4)}")
-        st.caption(land_note)
-        if any(k in hg for k in ("급경사", "고지")):
-            st.warning(f"공식 지형높이가 '{hg}'입니다. 노인·유모차 가구는 피할 수 있어 매수층이 좁아집니다.")
-        if "맹지" in rs:
-            st.error("길에 접하지 않은 땅(맹지)입니다. 재건축·대출에 불리할 수 있습니다.")
-        report["land"] = dict(hg=hg, rs=rs, zone=land.get("prposArea1Nm", "-"), price=price_m2,
-                              area=to_num(land.get("lndpclAr")), shape=land.get("tpgrphFrmCodeNm", "-"), note=land_note)
-    elif not vworld_key:
-        st.caption("브이월드 키를 넣으면 공식 지형높이·도로 접면·용도지역·공시지가도 함께 나옵니다.")
-    # 1) 주변 지형: 물건 둘레 8방향(150m·300m) 높이와 비교
+    hg = land.get("tpgrphHgCodeNm", "") if land else ""
+
+    verdict_slot = st.container()     # 종합 판정은 아래 값을 다 구한 뒤 맨 위에 채움
+    levels, slope_rep = [], {}
+
+    # 1) 동네·물건 자리: 물건 둘레 8방향(150m·300m) 높이 비교
     ring_pts = [(lat0, lon0)] + [offset(lat0, lon0, d, b) for d in (150, 300) for b in range(0, 360, 45)]
     el = fetch_elev(tuple(p[0] for p in ring_pts), tuple(p[1] for p in ring_pts))
-    slope_rep = {}
+    dirs = ["북", "북동", "동", "남동", "남", "남서", "서", "북서"]
     if not el:
         st.info("높이 자료를 불러오지 못했습니다. 잠시 후 다시 열어 보세요.")
     else:
@@ -2633,17 +2771,27 @@ with tab4:
             terrain = "평지"
         else:
             terrain = "경사지 (한쪽이 높고 한쪽이 낮음)"
-        steep_dir = max(range(8), key=lambda i: abs(near[i] - h0))
-        dirs = ["북", "북동", "동", "남동", "남", "남서", "서", "북서"]
-        t1, t2, t3 = st.columns(3)
-        t1.metric("물건 해발", f"{h0:.0f}m")
-        t2.metric("주변 지형", terrain.split(" (")[0])
-        t3.metric("반경 300m 높이차", f"{rng:.0f}m")
-        st.caption(f"{terrain}. 150m 안에서 높이 차이가 가장 큰 쪽은 **{dirs[steep_dir]}쪽**"
-                   f"({near[steep_dir] - h0:+.0f}m)입니다.")
-        slope_rep.update(h0=h0, terrain=terrain, rng=rng)
+        # 동네: 어느 쪽으로든 300m 걸으면 평균 몇 % 오르내리나
+        area_pct = sum(abs(h - h0) for h in far) / len(far) / 300 * 100
+        # 물건 자리: 물건을 가운데 두고 양쪽 150m씩(300m) 높이차가 가장 큰 방향의 경사
+        axis = max(range(4), key=lambda i: abs(near[i] - near[i + 4]))
+        site_pct = abs(near[axis] - near[axis + 4]) / 300 * 100
+        up_dir = dirs[axis] if near[axis] > near[axis + 4] else dirs[axis + 4]
+        lv_area, lv_site = slope_grade(area_pct), slope_grade(site_pct)
+        # 공식 지형높이(필지 단위 조사값)가 있으면 물건 자리 판정에 반영
+        lv_site = max(lv_site, HG_LEVEL.get(hg, 0))
+        levels += [lv_area, lv_site]
+        c1, c2 = st.columns(2)
+        c1.markdown(slope_card("동네 전체 (반경 300m)", lv_area,
+                               f"어느 쪽으로든 300m 걸으면 평균 <b>{area_pct:.0f}%</b> 오르내림<br>"
+                               f"가장 높은 곳과 낮은 곳 차이 {rng:.0f}m"), unsafe_allow_html=True)
+        c2.markdown(slope_card("물건 자리", lv_site,
+                               f"{terrain.split(' (')[0]} · <b>{up_dir}쪽</b>이 높음 (경사 약 {site_pct:.0f}%)"
+                               + (f"<br>공식 지형 분류: <b>{_e(hg)}</b>" if hg else "")), unsafe_allow_html=True)
+        slope_rep.update(h0=h0, terrain=terrain, rng=rng, area_pct=area_pct, site_pct=site_pct,
+                         lv_area=lv_area, lv_site=lv_site)
 
-    # 2) 역·정류장·학교 → 물건 경사 그래프
+    # 2) 역·정류장·학교에서 걸어올 때
     starts = {}
     for label, params, _ in PLACES:
         if label in ("지하철역", "버스정류장", "초등학교"):
@@ -2653,7 +2801,7 @@ with tab4:
     if starts:
         if st.session_state.get("w_slp") not in starts:
             st.session_state["w_slp"] = next(iter(starts))
-        st.radio("어디서 걸어올 때?", list(starts), key="w_slp", horizontal=True)
+        st.radio("걸어올 때 (출발지)", list(starts), key="w_slp", horizontal=True)
         sp = starts[st.session_state.w_slp]
         dist = haversine_m(sp["lat"], sp["lon"], lat0, lon0)
         n = int(min(max(dist / 30, 5), 60))
@@ -2661,41 +2809,77 @@ with tab4:
         pe = fetch_elev(tuple(p[0] for p in pts), tuple(p[1] for p in pts))
         if pe:
             seg = dist / n
-            prof = pd.DataFrame({"거리(m)": [round(seg * i) for i in range(n + 1)], "해발(m)": pe})
-            grads = [(pe[i + 1] - pe[i]) / seg * 100 for i in range(n)]
-            # 지형 자료가 90m 간격이라 3칸씩 묶어 평균 경사를 봄
-            win = 3
+            win = 3   # 지형 자료가 약 90m 간격이라 3칸씩 묶어 평균 경사를 봄
             smooth = [(pe[min(i + win, n)] - pe[i]) / (seg * (min(i + win, n) - i)) * 100 for i in range(n)]
-            prof["경사"] = ["가파름" if abs(g) >= 8 else "완만·평지" for g in smooth] + ["완만·평지"]
             climb = pe[-1] - pe[0]
             avg = climb / dist * 100 if dist else 0
-            steep_i = next((i for i, g in enumerate(smooth) if g >= 8), None)
-            g1, g2, g3 = st.columns(3)
-            g1.metric(f"{sp['name']}에서", f"{climb:+.0f}m", "오르막" if climb > 2 else "내리막" if climb < -2 else "거의 평지",
-                      delta_color="off")
-            g2.metric("평균 경사", f"{avg:+.1f}%", slope_label(avg), delta_color="off")
-            g3.metric("가장 가파른 구간", f"{max(smooth, key=abs):+.1f}%", slope_label(max(smooth, key=abs)),
-                      delta_color="off")
-            area = alt.Chart(prof).mark_area(opacity=0.25, color="#1C7ED6").encode(
-                x=alt.X("거리(m):Q", title=f"{sp['name']} → 경매 물건 (직선 {dist:,.0f}m)"),
-                y=alt.Y("해발(m):Q", scale=alt.Scale(zero=False)))
-            line = alt.Chart(prof).mark_line(color="#1C7ED6").encode(x="거리(m):Q", y="해발(m):Q")
-            dots = alt.Chart(prof).mark_circle(size=45).encode(
-                x="거리(m):Q", y="해발(m):Q",
-                color=alt.Color("경사:N", scale=alt.Scale(domain=["가파름", "완만·평지"],
-                                                       range=["#E03131", "#1C7ED6"]), legend=None),
-                tooltip=["거리(m)", "해발(m)", "경사"])
-            st.altair_chart((area + line + dots).properties(height=200), use_container_width=True)
-            if steep_i is not None:
-                st.caption(f"빨간 점부터 오르막이 가팔라집니다: 출발 후 약 {seg * steep_i:,.0f}m 지점부터. "
-                           "노인·유모차 가구에는 부담이 될 수 있습니다.")
+            maxg = max(smooth, key=abs)
+            steep_i = next((i for i, g in enumerate(smooth) if abs(g) >= 8), None)
+            lv_walk = slope_grade(abs(maxg), walk=True)
+            levels.append(lv_walk)
+            nm = sp["name"]
+            if climb > 2:
+                how = f"{_e(nm)} → 집: <b>{climb:.0f}m 올라가는 오르막</b>"
+            elif climb < -2:
+                how = (f"{_e(nm)} → 집: {-climb:.0f}m 내리막<br>"
+                       f"집 → {_e(nm)}: <b>{-climb:.0f}m 올라가는 오르막</b>")
             else:
-                st.caption("큰 오르막 없이 걸어올 수 있는 길입니다(직선 기준).")
-            slope_rep.update(start=sp["name"], climb=climb, avg=avg,
-                             maxg=max(smooth, key=abs), steep_at=(seg * steep_i if steep_i is not None else None))
-    st.caption("경사 기준: 3% 미만 평지 · 3–8% 완만 · 8–12% 가파름 · 12% 이상 매우 가파름. "
-               "고도 자료가 약 90m 간격이고 직선으로 잰 값이라, 골목 계단·실제 길의 경사는 로드뷰로 꼭 확인하세요.")
+                how = f"{_e(nm)} ↔ 집: 높이 차이 거의 없음"
+            how += (f"<br>직선 {dist:,.0f}m · 가장 가파른 곳 약 <b>{abs(maxg):.0f}%</b>"
+                    + (f" (출발 후 {seg * steep_i:,.0f}m 지점부터)" if steep_i is not None else ""))
+            st.markdown(slope_card(f"걸어올 때 · {st.session_state.w_slp}", lv_walk, how), unsafe_allow_html=True)
+            with st.expander("걸어오는 길 높이 그래프"):
+                prof = pd.DataFrame({"거리(m)": [round(seg * i) for i in range(n + 1)], "해발(m)": pe})
+                prof["경사"] = ["가파름" if abs(g) >= 8 else "완만·평지" for g in smooth] + ["완만·평지"]
+                area_c = alt.Chart(prof).mark_area(opacity=0.25, color="#1C7ED6").encode(
+                    x=alt.X("거리(m):Q", title=f"{nm}(왼쪽) → 경매 물건(오른쪽)"),
+                    y=alt.Y("해발(m):Q", scale=alt.Scale(zero=False)))
+                line = alt.Chart(prof).mark_line(color="#1C7ED6").encode(x="거리(m):Q", y="해발(m):Q")
+                dots = alt.Chart(prof).mark_circle(size=45).encode(
+                    x="거리(m):Q", y="해발(m):Q",
+                    color=alt.Color("경사:N", scale=alt.Scale(domain=["가파름", "완만·평지"],
+                                                           range=["#E03131", "#1C7ED6"]), legend=None),
+                    tooltip=["거리(m)", "해발(m)", "경사"])
+                st.altair_chart((area_c + line + dots).properties(height=200), use_container_width=True)
+                st.caption("선이 올라가면 오르막, 내려가면 내리막입니다. 빨간 점 구간이 가파른 곳(8% 이상)입니다.")
+            slope_rep.update(start=nm, climb=climb, avg=avg, maxg=maxg, lv_walk=lv_walk,
+                             steep_at=(seg * steep_i if steep_i is not None else None))
+
+    if levels:
+        top = max(levels)
+        msg = SLOPE_VERDICT[top]
+        with verdict_slot:
+            [st.success, st.info, st.warning, st.error][top](f"**{SLOPE_LV[top][0]} {SLOPE_LV[top][1]}** — {msg}")
+        slope_rep["verdict"] = f"{SLOPE_LV[top][1]} — {msg}"
+    st.caption("높이 자료가 약 90m 간격이라 큰 언덕은 잡지만 골목 계단·짧은 급경사는 못 잡습니다. 로드뷰로 꼭 확인하세요.")
     report["slope"] = slope_rep or None
+
+    # 토지 정보 (공식) — 경사와 따로 봄
+    if land:
+        st.markdown("#### 토지 정보 (공식)")
+        rs = land.get("roadSideCodeNm", "-")
+        price_m2 = to_num(land.get("pblntfPclnd"))
+        l1, l2, l3 = st.columns(3)
+        l1.metric("도로 접면", rs, help=road_help(rs))
+        l2.metric("용도지역", land.get("prposArea1Nm", "-"))
+        l3.metric("공시지가", f"{price_m2 / 1e4:,.0f}만/㎡", f"평당 {price_m2 * PYEONG / 1e4:,.0f}만", delta_color="off")
+        land_note = f"{land.get('stdrYear', '')}년 기준 · 대지 {to_num(land.get('lndpclAr')):,.1f}㎡ · " \
+                    f"모양 {land.get('tpgrphFrmCodeNm', '-')} · 이용상황 {land.get('ladUseSittnNm', '-')} · 도로: {road_help(rs)}"
+        # 세대당 대지지분 추정 (건축물대장 표제부의 대지면적 ÷ 세대수)
+        tl = expos_store().get(("title", st.session_state.get("b_code", ""), st.session_state.get("t_jibun", "")))
+        if isinstance(tl, list) and tl:
+            hh = max(to_num(tl[0].get("hhldCnt")), to_num(tl[0].get("hoCnt")))
+            if hh:
+                share = to_num(land.get("lndpclAr")) / hh
+                land_note += (f" · 세대당 대지지분 약 {share:.1f}㎡({share / PYEONG:.1f}평) → "
+                              f"공시지가 기준 땅값 약 {won(share * price_m2 / 1e4)}")
+        st.caption(land_note)
+        if "맹지" in rs:
+            st.error("길에 접하지 않은 땅(맹지)입니다. 재건축·대출에 불리할 수 있습니다.")
+        report["land"] = dict(hg=hg or "-", rs=rs, zone=land.get("prposArea1Nm", "-"), price=price_m2,
+                              area=to_num(land.get("lndpclAr")), shape=land.get("tpgrphFrmCodeNm", "-"), note=land_note)
+    elif not vworld_key:
+        st.caption("브이월드 키를 넣으면 공식 지형 분류·도로 접면·용도지역·공시지가도 함께 나옵니다.")
 
 
 # ── 입지 (건물·입지 탭 아래쪽)
@@ -2771,23 +2955,39 @@ with tab4:
         cells["label"] = [f"점포 {n}곳\n주요 업종: {t}" for n, t in zip(cells["n"], cells["top"])]
         hub = cells.sort_values("n", ascending=False).iloc[0]
         hub_m = haversine_m(lat0, lon0, hub["lat"], hub["lon"])
-        import pydeck as pdk
-        ring = pd.DataFrame({"lat": [lat0], "lon": [lon0], "label": ["경매 물건"]})
-        z = 16 if sr <= 300 else 15 if sr <= 500 else 14
-        st.pydeck_chart(pdk.Deck(
-            layers=[
-                pdk.Layer("ScatterplotLayer", ring, get_position="[lon, lat]", filled=False, stroked=True,
-                          get_line_color=[28, 126, 214], line_width_min_pixels=2, get_radius=sr),
-                pdk.Layer("ScatterplotLayer", cells, get_position="[lon, lat]", get_fill_color="color",
-                          get_radius="radius", pickable=True),
-                pdk.Layer("ScatterplotLayer", ring, get_position="[lon, lat]", filled=False, stroked=True,
-                          get_line_color=[20, 20, 20], line_width_min_pixels=3, get_radius=12,
-                          radius_min_pixels=8, pickable=True),
-            ],
-            initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=z),
-            tooltip={"text": "{label}"}, map_style=LIGHT_MAP,
-            views=[pdk.View(type="MapView", controller=False)]), use_container_width=True)
-        st.caption(f"빨간 원이 크고 진할수록 점포가 몰린 곳입니다. 파란 테두리는 반경 {sr}m, 검은 테두리가 경매 물건. "
+        kjs = secret("KAKAO_JS_KEY")
+        if kjs:
+            # 카카오맵: 건물·가게 이름이 보여 밀집한 곳이 실제로 어떤 거리인지 알 수 있음
+            cell_m = 50 if sr <= 300 else 55 if sr <= 500 else 60   # 약 100m 칸 → 원 반지름 최대치(m)
+            ldata = {
+                "target": {"lat": lat0, "lon": lon0, "title": "경매 물건", "label": st.session_state.addr},
+                "points": [], "fit": True, "movable": False,
+                "ring": {"lat": lat0, "lon": lon0, "r": sr},
+                "circles": [{"lat": float(c.lat), "lon": float(c.lon),
+                             "r": float(10 + (cell_m - 10) * c.n / mx), "op": round(.12 + .43 * c.n / mx, 2),
+                             "title": f"점포 {int(c.n)}곳", "label": f"주요 업종: {c.top}"}
+                            for c in cells.itertuples()],
+            }
+            components.html(kakao_map_html(kjs, ldata, 420), height=430)
+        else:
+            import pydeck as pdk
+            ring = pd.DataFrame({"lat": [lat0], "lon": [lon0], "label": ["경매 물건"]})
+            z = 16 if sr <= 300 else 15 if sr <= 500 else 14
+            st.pydeck_chart(pdk.Deck(
+              layers=[
+                  pdk.Layer("ScatterplotLayer", ring, get_position="[lon, lat]", filled=False, stroked=True,
+                            get_line_color=[28, 126, 214], line_width_min_pixels=2, get_radius=sr),
+                  pdk.Layer("ScatterplotLayer", cells, get_position="[lon, lat]", get_fill_color="color",
+                            get_radius="radius", pickable=True),
+                  pdk.Layer("ScatterplotLayer", ring, get_position="[lon, lat]", filled=False, stroked=True,
+                            get_line_color=[20, 20, 20], line_width_min_pixels=3, get_radius=12,
+                            radius_min_pixels=8, pickable=True),
+              ],
+              initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=z),
+              tooltip={"text": "{label}"}, map_style=LIGHT_MAP,
+              views=[pdk.View(type="MapView", controller=False)]), use_container_width=True)
+        st.caption(f"빨간 원이 크고 진할수록 점포가 몰린 곳입니다(누르면 점포 수·주요 업종). 파란 테두리는 반경 {sr}m, "
+                   f"{'빨간 고리' if kjs else '검은 테두리'}가 경매 물건. "
                    f"가장 밀집한 곳(상권 중심)까지 약 {hub_m:,.0f}m, 도보 약 {hub_m * WALK_FACTOR / WALK_M_PER_MIN:.0f}분.")
 
         lc = sdf["indsLclsNm"].replace("", "기타").value_counts()
@@ -2884,6 +3084,14 @@ with tab6:
         "c_taxmode": "매매사업자(종합소득세)",
         "c_target": 1000,
     }
+    # 예상 매도가 탭 값이 바뀌면 계산기의 낙찰가·매도가·수리비도 따라 바꿈.
+    # (전에는 처음 한 번만 채워서, 평단가를 고치거나 다른 물건을 보면 옛 값이 남았음)
+    # 계산기에서 직접 고친 값은 예상 매도가 탭이 다시 바뀌기 전까지 그대로 둠
+    if r_est.get("sell"):
+        _sync = (int(r_est["sell"]), max(0, int(r_est.get("bid") or 0)), int(r_est.get("repair") or 0))
+        if ss.get("_c_sync") != _sync:
+            ss["c_sell"], ss["c_bid"], ss["c_repair"] = _sync
+            ss["_c_sync"] = _sync
     for k, d in c_defaults.items():
         if k not in ss:
             raw = qp.get(k)
@@ -2964,7 +3172,9 @@ with tab6:
         st.caption("경매 단기 보유라면 만기일시(이자만 납부)로 보유 개월 수만큼 넣어 이자 비용을 가늠하세요.")
 
     else:  # 경매 수익
-        st.caption("예상 매도가 탭의 값으로 처음 채워집니다. 값을 바꾸면 그대로 기억합니다.")
+        st.caption(f"낙찰가·예상 매도가·수리비는 '예상 매도가' 탭 값(최대 입찰가 {won(r_est['bid'])}, "
+                   f"예상 매도가 {won(r_est['sell'])})으로 자동으로 맞춰집니다. 여기서 바꿔 볼 수도 있습니다."
+                   if r_est.get("sell") else "예상 매도가 탭을 먼저 보면 값이 자동으로 채워집니다.")
         a1, a2 = st.columns(2)
         a1.number_input("낙찰가 (만원)", 0, 10_000_000, step=10, key="c_bid")
         a2.number_input("예상 매도가 (만원)", 0, 10_000_000, step=10, key="c_sell")
@@ -2992,6 +3202,15 @@ with tab6:
         pf = auction_profit(bid_w, *args)
         t, sale_fee, interest, gap, pre_tax = pf["t"], pf["sale_fee"], pf["interest"], pf["gap"], pf["pre"]
         tax, tax_note, after, own_cash = pf["tax"], pf["note"], pf["after"], pf["cash"]
+        loss_msgs = []
+        if min_bid * 1e4 >= sell_w > 0:
+            loss_msgs.append(f"최저가 {won(min_bid)}가 예상 매도가 {won(sell_w / 1e4)}보다 높습니다. "
+                             "최저가에 낙찰받아도 손해이니, 예상 매도가가 맞는지 다시 보거나 유찰(최저가 하락)을 기다리세요.")
+        elif bid_w >= sell_w > 0:
+            loss_msgs.append(f"낙찰가 {won(bid_w / 1e4)}가 예상 매도가 {won(sell_w / 1e4)} 이상이라 팔아도 차익이 없고, "
+                             "취득세·중개보수·수리비만큼 손해입니다. 낙찰가를 낮춰 보세요.")
+        for m_ in loss_msgs:
+            st.error(m_)
         m1, m2, m3 = st.columns(3)
         m1.metric("매매 차익 (매도가 − 낙찰가)", won(gap / 1e4))
         m2.metric("세전 순이익", won(pre_tax / 1e4))
@@ -3050,7 +3269,7 @@ with tab6:
         st.dataframe(pd.DataFrame(rows_b), hide_index=True, use_container_width=True)
         st.caption("대출금은 위에 넣은 금액으로 고정해 계산합니다. 낙찰가에 비례해 대출이 늘면 필요 현금은 줄고 이자는 늘어납니다.")
 
-        report["calc"] = dict(gap=gap, pre=pre_tax, after=after, tax=tax, note=tax_note,
+        report["calc"] = dict(bid=bid_w, sell=sell_w, extra=extra_w, warn=loss_msgs, gap=gap, pre=pre_tax, after=after, tax=tax, note=tax_note,
                               acq=t["total"], fee=sale_fee, interest=interest, cash=own_cash,
                               target=ss.c_target, max_bid=max_bid, table=rows_b)
 
@@ -3063,23 +3282,32 @@ def build_report_html() -> str:
     parts = [f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <title>빌라 시세조사 - {e(st.session_state.addr)}</title>
 <style>
-  @page {{ size: A4; margin: 12mm; }}
-  /* 오래된 프린터에서도 잘 보이도록: 검정 글자, 굵게, 크게, 굵은 선, 회색 배경 없음 */
+  @page {{ size: A4; margin: 8mm 9mm; }}
+  /* 글자는 검정, 배경에 옅은 음영으로 칸을 나누고, 중요한 값만 빨강·굵게·밑줄 */
   * {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
   body {{ font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; color: #000;
-         font-size: 14px; font-weight: 700; line-height: 1.45; }}
-  h1 {{ font-size: 24px; font-weight: 900; margin: 0 0 4px; }}
-  h2 {{ font-size: 18px; font-weight: 900; margin: 20px 0 6px; border-bottom: 3px solid #000; padding-bottom: 3px; }}
-  b {{ font-weight: 900; }}
-  .muted {{ color: #000; }}
-  .box {{ background: #fff; border: 2px solid #000; padding: 8px 10px; border-radius: 4px; margin: 6px 0; }}
-  .warn {{ border-width: 3px; border-style: double; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ border: 1.5px solid #000; padding: 5px 6px; text-align: left; color: #000; }}
-  th {{ background: #fff; font-weight: 900; }}
+         font-size: 10.5px; font-weight: 400; line-height: 1.35; }}
+  h1 {{ font-size: 18px; font-weight: 800; margin: 0 0 3px; padding-bottom: 4px; border-bottom: 4px solid #1c3d6e; }}
+  h2 {{ font-size: 12.5px; font-weight: 800; margin: 10px 0 4px; padding: 3px 8px;
+        background: #e6edf6; border-left: 6px solid #1c3d6e; border-radius: 3px; page-break-after: avoid; }}
+  b {{ font-weight: 800; }}
+  .muted {{ color: #000; font-size: 10px; margin-bottom: 2px; }}
+  .box {{ background: #f6f7f9; border: 1px solid #ced4da; border-left: 4px solid #868e96;
+          padding: 3px 8px; border-radius: 3px; margin: 3px 0; }}
+  .warn {{ background: #fff5f5; border-color: #f1aeb5; border-left: 4px solid #e03131; color: #c92a2a; font-weight: 700; }}
+  .good {{ background: #f3faf4; border-color: #b2dfbd; border-left: 4px solid #2f9e44; }}
+  .hi {{ color: #c92a2a; font-weight: 800; }}
+  .u {{ text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 3px; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 2px 0; }}
+  th, td {{ border: 1px solid #adb5bd; padding: 2px 5px; text-align: left; color: #000; }}
+  th {{ background: #eef1f4; font-weight: 700; }}
+  tr:nth-child(even) td {{ background: #fafbfc; }}
   td.num {{ text-align: right; }} tr {{ page-break-inside: avoid; }}
-  .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }}
-  .grid div {{ border: 2px solid #000; padding: 6px; border-radius: 4px; }} .grid b {{ display: block; font-size: 17px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }}
+  .grid div {{ background: #f1f5fa; border: 1px solid #ced4da; padding: 3px 6px; border-radius: 4px; font-size: 10px; }}
+  .grid b {{ display: block; font-size: 13px; margin-top: 1px; }}
+  .grid div.key {{ background: #fff5f5; border-color: #e03131; }}
+  .grid div.key b {{ color: #c92a2a; text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 3px; }}
 </style></head><body>
 <h1>빌라 시세조사</h1>
 <div class="muted">{today} 출력 · 최근 {months}개월 국토부 실거래가 기준</div>
@@ -3092,7 +3320,7 @@ def build_report_html() -> str:
     for name, label, share, rank, top in report["fit"]:
         parts.append(f"<tr><td>{e(name)}</td><td>{e(label)}</td><td class='num'>{share:.0f}%</td>"
                      f"<td class='num'>{rank}위</td><td>{e(top)}</td></tr>")
-    parts.append(f"</table><div class='box'>{e(report['verdict'])}</div>")
+    parts.append(f"</table><div class='box'><b>{e(report['verdict'])}</b></div>")
     tp = report.get("temp")
     if tp:
         parts.append(f"<div class='box'>시장 온도: <b>{e(tp['label'])}</b> — 최근 3개월 거래 {tp['cnt']}건 "
@@ -3113,9 +3341,9 @@ def build_report_html() -> str:
         est = r["est"]
         parts.append(f"""<h2>예상 매도가 · 입찰가</h2>
 <div class="grid"><div>예상 매도가<b>{won(r['sell'])}</b></div><div>적용 평단가<b>{r['ppy']:,.0f}만</b></div>
-<div>평단가 범위(중간 50%)<b>{est['p25']:,.0f}–{est['p75']:,.0f}만</b></div><div>최대 입찰가<b>{won(r['bid'])}</b></div></div>
+<div>평단가 범위(중간 50%)<b>{est['p25']:,.0f}–{est['p75']:,.0f}만</b></div><div class="key">최대 입찰가<b>{won(r['bid'])}</b></div></div>
 <div class="box">예상 매도가 {won(r['sell'])} − 수리비 {won(r['repair'])} − 부대비용 {won(r['extra'])} − 희망 차익 {won(r['profit'])}
-= 최대 입찰가 {won(r['bid'])} (최저가 {won(min_bid)} 대비 {'+' if r['bid'] >= min_bid else '−'}{won(abs(r['bid'] - min_bid))})</div>""")
+= <b class="hi u">최대 입찰가 {won(r['bid'])}</b> (최저가 {won(min_bid)} 대비 {'+' if r['bid'] >= min_bid else '−'}{won(abs(r['bid'] - min_bid))})</div>""")
         if est["spread"] >= 2.0 or est["n_out"] > 0:
             parts.append(f"<div class='box warn'>평단가 편차 {est['spread']:.1f}배, 이상치 {est['n_out']}건 제외 "
                          f"(업계약 가능성 확인 필요)</div>")
@@ -3125,32 +3353,16 @@ def build_report_html() -> str:
         parts.append("<h2>전월세</h2><table>")
         if rr.get("j_price"):
             ratio = f"{rr['ratio'] * 100:.0f}%" if rr.get("ratio") else "-"
-            parts.append(f"<tr><th>예상 전세가</th><td>{won(rr['j_price'])} (전세 {rr['nj']}건)</td>"
+            parts.append(f"<tr><th>예상 전세가</th><td><b>{won(rr['j_price'])}</b> (전세 {rr['nj']}건)</td>"
                          f"<th>전세가율</th><td>{ratio}</td></tr>"
-                         f"<tr><th>전세 후 남는 투자금</th><td colspan='3'>{won(rr['left']) if rr['left'] > 0 else '회수 초과'}</td></tr>")
+                         f"<tr><th>전세 후 남는 투자금</th><td colspan='3'><b class='u'>{won(rr['left']) if rr['left'] > 0 else '회수 초과'}</b></td></tr>")
         if rr.get("rent_med") is not None:
             yld = f"{rr['yld']:.1f}%" if rr.get("yld") else "-"
             parts.append(f"<tr><th>월세 시세</th><td>{won(rr['dep_med'])} / {rr['rent_med']:,.0f}만 ({rr['nw']}건)</td>"
                          f"<th>월세 수익률</th><td>{yld}</td></tr>")
         parts.append("</table>")
 
-    wx_r = report.get("weather")
-    if wx_r:
-        wd = ["월", "화", "수", "목", "금", "토", "일"]
-        parts.append("<h2>임장 날씨 (7일)</h2><table><tr>" + "".join(
-            f"<th>{pd.Timestamp(w['date']).month}/{pd.Timestamp(w['date']).day}"
-            f"({wd[pd.Timestamp(w['date']).weekday()]})</th>" for w in wx_r) + "</tr><tr>" + "".join(
-            f"<td style='text-align:center'>{w['icon']} {e(w['desc'])}<br>{w['tmax']:.0f}°/{w['tmin']:.0f}°<br>"
-            f"☔{w['pop'] if w['pop'] is not None else '-'}%{' 👍' if w['good'] else ''}</td>" for w in wx_r)
-            + "</tr></table>")
-    fd = report.get("food")
-    if fd:
-        parts.append(f"<h2>식사·휴식 ({e(fd['base'])} {e(fd['kind'])})</h2><table>"
-                     "<tr><th>이름</th><th>종류</th><th>거리</th><th>전화</th></tr>")
-        for f in fd["rows"]:
-            parts.append(f"<tr><td>{e(f['name'])}</td><td>{e(f['cat'])}</td>"
-                         f"<td class='num'>{f['dist']:,}m</td><td>{e(f['phone'])}</td></tr>")
-        parts.append("</table>")
+    # 임장 날씨·식사 정보는 보고서가 길어져 뺌 (앱 화면에서만 봄)
 
     lc = report.get("loc")
     if lc:
@@ -3166,9 +3378,11 @@ def build_report_html() -> str:
     if ap_ and ap_.get("price"):
         parts.append(f"<h2>공시가격 ({ap_['year']}년)</h2><table>"
                      f"<tr><th>공시가격</th><td>{won(ap_['price'] / 1e4)}</td><th>1억 이하</th>"
-                     f"<td>{'예 (취득세 중과 제외)' if ap_['price'] <= 1e8 else '아니오'}</td></tr>"
-                     f"<tr><th>전세보증보험 한도</th><td>{won(ap_['cap'] / 1e4)}</td><th>기준</th><td>{e(ap_['how'])}</td></tr>"
-                     f"</table>")
+                     f"<td>{'<b class=u>예 (취득세 중과 제외)</b>' if ap_['price'] <= 1e8 else '아니오'}</td></tr>"
+                     f"<tr><th>전세보증보험 한도</th><td><b class='hi'>{won(ap_['cap'] / 1e4)}</b></td><th>기준</th><td>{e(ap_['how'])}</td></tr>"
+                     + (f"<tr><th>같은 건물 비율 시세</th><td><b>{won(ap_['bld_est'])}</b></td><th>근거</th>"
+                        f"<td>실거래 {ap_['n_same']}건 · 공시가의 {ap_['ratio']:.2f}배</td></tr>" if ap_.get("bld_est") else "")
+                     + "</table>")
 
     ld_ = report.get("land")
     if ld_:
@@ -3181,7 +3395,9 @@ def build_report_html() -> str:
 
     sp_ = report.get("slope")
     if sp_:
-        parts.append("<h2>지형·경사</h2><table>")
+        _sl_cls = "box warn" if max(sp_.get("lv_area", 0), sp_.get("lv_site", 0), sp_.get("lv_walk", 0)) >= 2 else "box good"
+        parts.append("<h2>지형·경사</h2>" + (f"<div class='{_sl_cls}'><b>{e(sp_['verdict'])}</b></div>" if sp_.get("verdict") else "")
+                     + "<table>")
         if sp_.get("h0") is not None:
             parts.append(f"<tr><th>물건 해발</th><td>{sp_['h0']:.0f}m</td><th>주변 지형</th><td>{e(sp_['terrain'])}</td></tr>")
         if sp_.get("start"):
@@ -3202,15 +3418,20 @@ def build_report_html() -> str:
 
     cl = report.get("calc")
     if cl:
-        parts.append(f"""<h2>경매 수익 계산 (어림)</h2><table>
+        parts.append("<h2>경매 수익 계산 (어림)</h2>" + "".join(f"<div class='box warn'>{e(m_)}</div>" for m_ in cl.get("warn", [])))
+        if cl.get("sell"):
+            parts.append(f"<table><tr><th>낙찰가</th><td>{won(cl['bid'] / 1e4)}</td><th>예상 매도가</th><td>{won(cl['sell'] / 1e4)}</td></tr>"
+                         f"<tr><th>수리·명도·기타</th><td>{won(cl['extra'] / 1e4)}</td><th>계산 방식</th>"
+                         f"<td>매도가 − 낙찰가 − 비용 − 세금</td></tr></table>")
+        parts.append(f"""<table>
 <tr><th>매매 차익</th><td>{won(cl['gap'] / 1e4)}</td><th>세전 순이익</th><td>{won(cl['pre'] / 1e4)}</td></tr>
 <tr><th>취득세 등</th><td>{cl['acq']:,.0f}원</td><th>매도 중개보수</th><td>{cl['fee']:,.0f}원</td></tr>
 <tr><th>대출 이자</th><td>{cl['interest']:,.0f}원</td><th>세금</th><td>{cl['tax']:,.0f}원</td></tr>
-<tr><th>세후 순이익</th><td><b>{won(cl['after'] / 1e4)}</b></td><th>필요 현금</th><td>{cl['cash']:,.0f}원</td></tr>
+<tr><th>세후 순이익</th><td><b class="hi u">{won(cl['after'] / 1e4)}</b></td><th>필요 현금</th><td>{cl['cash']:,.0f}원</td></tr>
 </table><div class='box'>{e(cl['note'])}. 법정 세율 기준 어림값이며 실제 세금은 세무사와 확인하세요.</div>""")
         if cl.get("table"):
             mb = f"최대 {won(cl['max_bid'] / 1e4)}" if cl.get("max_bid") else "달성 어려움"
-            parts.append(f"<p><b>입찰가별 수익표</b> (목표 세후 {won(cl['target'])} → {mb})</p><table><tr>"
+            parts.append(f"<p style='margin:5px 0 2px'><b>입찰가별 수익표</b> (목표 세후 {won(cl['target'])} → {mb})</p><table><tr>"
                          + "".join(f"<th>{e(k)}</th>" for k in cl["table"][0]) + "</tr>")
             for row in cl["table"]:
                 parts.append("<tr>" + "".join(f"<td class='num'>{e(str(v))}</td>" for v in row.values()) + "</tr>")
@@ -3255,14 +3476,11 @@ def build_report_html() -> str:
         parts.append("</table>")
     ck = report.get("ck")
     if ck is not None:
-        parts.append("<h2>임장 체크리스트</h2>")
-        for m in ck["focus"]:
-            parts.append(f"<div class='box warn'>{e(m)}</div>")
-        for section, items in CHECKLIST:
-            parts.append(f"<p style='margin:8px 0 2px'><b>{e(section)}</b></p>")
-            for cid, text in items:
-                mark = "☑" if cid in ck["done"] else "☐"
-                parts.append(f"<div style='margin:2px 0 2px 8px'>{mark} {e(text)}</div>")
+        # 보고서가 길어져 전체 체크 항목은 빼고, 이 물건에서 특히 볼 것(빨간 요약)만 넣음
+        if ck["focus"]:
+            parts.append("<h2>임장 때 특히 볼 것</h2>")
+            for m in ck["focus"]:
+                parts.append(f"<div class='box warn'>{e(m)}</div>")
     parts.append("</body></html>")
     return "".join(parts)
 
