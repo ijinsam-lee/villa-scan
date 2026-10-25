@@ -1528,6 +1528,10 @@ html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"], [data-tes
 [data-testid="stMarkdownContainer"] h4, [data-testid="stHeading"] h4 {
   padding-top: 2.25rem !important; margin-top: 2rem !important;
 }
+/* 소제목 앞에 같은 기호(▶)를 붙여 칸 시작을 눈에 띄게 */
+[data-testid="stMarkdownContainer"] h4::before, [data-testid="stHeading"] h4::before {
+  content: "▶"; color: #1c3d6e; font-size: 0.75em; margin-right: 0.45em; position: relative; top: -0.1em;
+}
 /* 숫자 카드(metric) 글자를 본문과 어울리게 줄임 */
 [data-testid="stMetricValue"], [data-testid="stMetricValue"] div {
   font-size: 1.25rem !important; line-height: 1.4 !important; font-weight: 600 !important;
