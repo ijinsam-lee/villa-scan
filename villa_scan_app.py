@@ -18,6 +18,7 @@ from html import escape as _e
 import json
 import math
 import os
+import re
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -832,6 +833,7 @@ GUIDE_ALL = """
 
 ##### 추천 순서
 1. **왼쪽 메뉴**에 경매 물건의 지번 주소, 전용면적, 건축년도, 층, 최저가(호수는 선택)를 넣고 **시세 조회**를 누릅니다.
+   옥션원 물건 화면을 **PDF로 저장해 올리면** 이 칸들이 자동으로 채워지고, 맨 위에 **경매 정보 카드**(사진·차수별 최저가·권리 경고·동네 낙찰가율)가 나옵니다.
 2. **동네 프로필**: 이 동네에서 잘 팔리는 빌라 유형에 이 물건이 맞는지 봅니다. 안 맞으면 여기서 거릅니다.
 3. **비교사례**: 주변 비슷한 빌라의 실제 거래가를 보고, 임장할 곳을 체크해 동선을 짭니다.
 4. **예상 매도가**: 팔 수 있는 가격을 정하고, 최대 입찰가를 역산합니다.
@@ -851,6 +853,7 @@ GUIDE_ALL = """
 | 주소 찾기·주변 시설·역·지도·로드뷰 | 주소·장소 검색, 지도 | 카카오 |
 | 임장 동선 (실제 도보 경로) | 보행자 경로 | TMAP (SK open API) |
 | 지형·경사 높이, 임장 날씨 | 고도·일기예보 | Open-Meteo |
+| 경매 정보 카드 (올린 경우) | 법원경매정보 화면 PDF | 옥션원 (사용자가 올린 파일) |
 
 - 실거래가는 계약 후 30일 안에 신고되어 **최근 1–2달은 덜 잡힙니다.**
 - 동·호수는 층·면적으로 건축물대장과 맞춘 **추정**입니다.
@@ -1530,6 +1533,122 @@ def bin_chart(dist: pd.Series, highlight=None, height=200):
     ).properties(height=height))
 
 
+# ───────────────────────── 옥션원 PDF 읽기 ─────────────────────────
+
+AUC_RISKS = [  # (공백 없앤 본문에서 찾을 말, 수준, 안내)
+    ("대항력있", "err", "대항력 있는 임차인이 있을 수 있습니다. 낙찰자가 보증금을 떠안는지 매각물건명세서로 꼭 확인하세요."),
+    ("유치권", "err", "유치권 신고·언급이 있습니다. 공사대금 등을 낙찰자가 떠안을 수 있으니 성립 여부를 확인하세요."),
+    ("법정지상권", "err", "법정지상권 언급이 있습니다. 토지·건물 소유 관계를 확인하세요."),
+    ("위반건축물", "err", "위반건축물 언급이 있습니다. 이행강제금·대출 제한을 확인하세요."),
+    ("대지권미등기", "warn", "대지권 미등기 물건입니다. 대지권 포함 여부와 취득 절차를 확인하세요."),
+    ("토지별도등기", "warn", "토지 별도등기가 있습니다. 인수되는 권리가 있는지 확인하세요."),
+    ("지분매각", "err", "지분 매각입니다. 집 전체가 아니라 일부 지분만 사는 것입니다."),
+    ("재매각", "warn", "재매각 물건입니다. 입찰보증금이 보통 최저가의 20%이고, 이전 낙찰자가 잔금을 못 낸 이유를 확인하세요."),
+    ("특별매각조건", "warn", "특별매각조건이 붙어 있습니다. 주의사항을 꼭 읽으세요."),
+    ("선순위", "warn", "선순위 권리 언급이 있습니다. 말소기준권리보다 앞선 권리가 인수되는지 확인하세요."),
+    ("폐문부재", "warn", "현장 조사 때 아무도 만나지 못했습니다(폐문부재). 실제 점유자와 명도 난이도를 임장 때 확인하세요."),
+    ("점유관계미상", "warn", "점유 관계가 확인되지 않았습니다. 관리비 연체·우편물로 거주 여부를 확인하세요."),
+    ("반환청구권을포기", "good", "임차인(보증기관)이 못 받은 보증금을 낙찰자에게 청구하지 않는 조건입니다. 보증금 인수 부담이 줄어듭니다(매각물건명세서로 재확인)."),
+    ("제시외건물포함", "info", "제시외 건물(새시·창고 등)이 매각에 포함됩니다."),
+]
+
+
+def _num(s: str) -> float:
+    try:
+        return float(str(s).replace(",", "").replace("￦", "").strip())
+    except ValueError:
+        return 0.0
+
+
+def _between(t: str, start: str, ends: tuple, limit: int = 600) -> str:
+    i = t.find(start)
+    if i < 0:
+        return ""
+    i += len(start)
+    j = min([k for k in (t.find(e, i) for e in ends) if k > 0] or [i + limit])
+    return re.sub(r"\s+", " ", t[i:min(j, i + limit)]).strip(" :")
+
+
+def parse_auction_pdf(data: bytes) -> dict:
+    """옥션원 '법원경매정보' 화면을 PDF로 저장한 파일 → 경매 정보 dict (글자로 저장된 PDF만 가능)"""
+    import io
+    from pypdf import PdfReader
+    rd = PdfReader(io.BytesIO(data))
+    raw = "\n".join((p.extract_text() or "") for p in rd.pages)
+    # 옥션원 PDF는 띄어쓰기를 \x01 글자로 넣고, '소재지' 같은 칸 이름은 '소\x01재\x01지'처럼 한 글자씩 띄움
+    raw = re.sub(r"(?<![가-힣])[가-힣](?:\x01[가-힣])+(?![가-힣])", lambda m: m.group(0).replace("\x01", ""), raw)
+    t = raw.replace("\x01", " ")
+    t = re.sub(r"[ \t]+", " ", t)
+    ns = re.sub(r"\s+", "", t)
+    a: dict = {}
+    m = re.search(r"(\d{4})\s*타경\s*(\d+)", t)
+    a["case"] = f"{m.group(1)}타경{m.group(2)}" if m else ""
+    m = re.search(r"([가-힣]+지방법원[^/\n]*?)\s*/\s*매각기일\s*:\s*(\d{4}\.\d{2}\.\d{2})", t)
+    a["court"], a["date"] = (m.group(1).strip(), m.group(2)) if m else ("", "")
+    m = re.search(r"소재지\s+([^\n]+?,[^\n]+)", t) or re.search(r"소재지\s+(.+)", t)
+    loc = m.group(1).strip() if m else ""
+    a["loc"] = loc
+    base, _, rest = loc.partition(",")
+    a["addr"] = re.sub(r"번지$", "", base.strip())
+    a["bld_name"] = rest.strip().split(" ")[0] if rest.strip() else ""
+    m = re.search(r"([\d,]+)\s*호", rest)
+    a["ho"] = m.group(1).replace(",", "") if m else ""
+    m = re.search(r"(\d+)\s*층\s*중\s*(지하)?\s*(\d+)\s*층", t)
+    if m:
+        a["floor"] = -int(m.group(3)) if m.group(2) else int(m.group(3))
+    else:
+        m = re.search(r"(지하)?\s*(\d+)\s*층", rest)
+        a["floor"] = (-int(m.group(2)) if m.group(1) else int(m.group(2))) if m else None
+    m = re.search(r"물건종별\s+(\S+)", t)
+    a["kind"] = m.group(1) if m else ""
+    m = re.search(r"감정가\s+([\d,]+)\s*원", t)
+    a["appraisal"] = _num(m.group(1)) if m else 0
+    m = re.search(r"최저가\s*\((\d+)%\)\s*([\d,]+)\s*원", t)
+    a["min_pct"], a["min_price"] = (int(m.group(1)), _num(m.group(2))) if m else (None, 0)
+    m = re.search(r"보\s*증\s*금\s*\((\d+)%\)\s*([\d,]+)\s*원", t)
+    a["deposit_pct"], a["deposit"] = (int(m.group(1)), _num(m.group(2))) if m else (None, 0)
+    m = re.search(r"건물면적\s+([\d.]+)\s*㎡", t)
+    a["area"] = float(m.group(1)) if m else None
+    m = re.search(r"대지권\s+([\d.]+)\s*㎡", t)
+    a["land"] = float(m.group(1)) if m else None
+    m = re.search(r"사용승인일\s+(\d{4})\.\d{2}\.\d{2}", t)
+    if m:
+        a["year"] = int(m.group(1))
+    else:
+        m = re.search(r"층\s*중\s*\d+\s*층\s+(\d{2})\.\d{2}\.\d{2}", t)
+        a["year"] = (2000 + int(m.group(1)) if int(m.group(1)) <= date.today().year % 100 else 1900 + int(m.group(1))) if m else None
+    a["rounds"] = [dict(n=int(r[0]), date=r[1], price=_num(r[2]), result=r[3] or "")
+                   for r in re.findall(r"(\d+)\s*차\s+(\d{4}-\d{2}-\d{2})\s+([\d,]+)\s*원\s*(유찰|매각|변경|취하|기각|정지|불허|낙찰)?", t)]
+    m = re.search(r"말소기준권리\s*:\s*([\d.]+)", t)
+    a["base_right"] = m.group(1).rstrip(".") if m else ""
+    m = re.search(r"배당요구종기일\s*:\s*([\d.]+)", t)
+    a["claim_end"] = m.group(1).rstrip(".") if m else ""
+    m = re.search(r"채권액합계\s*:\s*([\d,]+)", t)
+    a["debt_total"] = _num(m.group(1)) if m else 0
+    m = re.search(r"공시가격\+?\s*\n?.*?(\d{4})\.\d{1,2}\s+([\d,]+)\s*원", t, re.S)
+    a["pub_year"], a["pub"] = (int(m.group(1)), _num(m.group(2))) if m and _num(m.group(2)) > 1e6 else (None, 0)
+    a["tenants"] = _between(t, "배당예상금액 기타", ("기타사항", "등기부현황"), 700)
+    a["note"] = _between(t, "기타사항", ("등기부현황", "건축물정보", "주의사항"), 500)
+    a["caution"] = _between(t, "주의사항", ("소재지 ", "건축물정보", "주택공시가격", "\n\n"), 500)
+    a["stations"] = [re.sub(r"\s+", " ", s).strip() for s in re.findall(r"\*\s*(\d+\s*호선\s*[가-힣A-Za-z]+역\s*[\d,.]+\s*k?m)", t)]
+    a["stats"] = [dict(period=r[0], n=int(r[1]), appr=_num(r[2]), sold=_num(r[3]), rate=float(r[4]),
+                       fails=float(r[5]), bidders=float(r[6]), expect=_num(r[7]))
+                  for r in re.findall(r"(최근1년간|6개월간|3개월간|1개월간)\s*\((\d+)건\)\s*￦?([\d,]+)\s*￦?([\d,]+)\s*"
+                                      r"([\d.]+)%\s*([\d.]+)회\s*([\d.]+)명\s*￦?([\d,]+)", t)]
+    a["risks"] = [(lv, msg) for key, lv, msg in AUC_RISKS if key in ns]
+    photos = []
+    for p in rd.pages:
+        try:
+            for im in p.images:
+                w, h = im.image.size
+                if w >= 150 and h >= 100:
+                    photos.append(im.data)
+        except Exception:
+            pass
+    a["photos"] = photos[:8]
+    return a
+
+
 # ───────────────────────── 화면 ─────────────────────────
 
 def secret(name: str) -> str:
@@ -1621,7 +1740,7 @@ for k, v in {
     "w_ho": qp.get("ho", ""),
     "w_m": qnum("m", 12, 6, 24),
     "w_r": _r if _r in (300, 500, 700, 1000) else 300,
-    "w_at": qnum("at", 3, 1, 6),
+    "w_at": qnum("at", 2, 1, 6),
     "w_yt": qnum("yt", 5, 2, 15),
     "w_rp": qnum("rp", 500, 0, 10000),
     "w_ex": qnum("ex", 400, 0, 10000),
@@ -1754,12 +1873,46 @@ with st.sidebar:
         area_m2, build_year = st.session_state.get("w_area", 42.0), st.session_state.get("w_year", 1990)
         floor, min_bid, ho_in = st.session_state.get("w_floor", 2), st.session_state.get("w_bid", 0), ""
         months, radius = st.session_state.get("w_m", 12), st.session_state.get("w_r", 300)
-        area_tol, age_tol = st.session_state.get("w_at", 3), st.session_state.get("w_yt", 5)
+        area_tol, age_tol = st.session_state.get("w_at", 2), st.session_state.get("w_yt", 5)
         st.button("처음부터 다시 (리셋)", on_click=reset_all, use_container_width=True,
                   help="입력값, 선택한 임장지, 조정한 값을 모두 지우고 새로 시작합니다.")
 
 if not region_mode:
   with st.sidebar:
+    # 옥션원 '법원경매정보' 화면을 PDF로 저장한 파일을 올리면 아래 입력칸을 채우고 바로 조회
+    up = st.file_uploader("옥션원 PDF 올리기 (선택)", type=["pdf"], key="w_pdf",
+                          help="옥션원 물건 화면에서 인쇄 → 'PDF로 저장'한 파일. 주소·면적·층·최저가가 자동으로 들어갑니다.")
+    if up is not None:
+        fid = f"{up.name}:{up.size}"
+        if st.session_state.get("auc_id") != fid:
+            st.session_state["auc_id"] = fid
+            try:
+                _a = parse_auction_pdf(up.getvalue())
+            except ImportError:
+                _a = {"error": "PDF 읽기 도구(pypdf)가 없습니다. requirements.txt에 pypdf를 넣거나 'pip install pypdf'를 실행하세요."}
+            except Exception as ex:
+                _a = {"error": f"PDF를 읽지 못했습니다 ({type(ex).__name__})"}
+            if _a.get("addr") and not _a.get("error"):
+                st.session_state["auc"] = _a
+                fill = {"w_addr": _a["addr"], "w_ho": _a.get("ho", "")}
+                if _a.get("area"):
+                    fill["w_area"] = float(_a["area"])
+                if _a.get("year"):
+                    fill["w_year"] = int(_a["year"])
+                if _a.get("floor") is not None:
+                    fill["w_floor"] = int(_a["floor"])
+                if _a.get("min_price"):
+                    fill["w_bid"] = int(round(_a["min_price"] / 1e4))
+                st.session_state.update(fill)
+                st.session_state["auc_autorun"] = True
+            else:
+                st.session_state["auc"] = None
+                st.session_state["auc_err"] = _a.get("error") or "경매 정보를 찾지 못했습니다. 옥션원 물건 화면을 PDF로 저장한 파일인지 확인하세요."
+    _a = st.session_state.get("auc")
+    if _a:
+        st.success(f"📄 {_a['case']} 읽음 · 아래 칸을 채웠습니다")
+    elif st.session_state.get("auc_err") and up is not None:
+        st.error(st.session_state["auc_err"])
     st.subheader("경매 물건")
     addr = st.text_input("주소 (지번 주소 권장)", key="w_addr",
                          help="예: 경기도 부천시 오정구 고강동 123-4")
@@ -1780,6 +1933,9 @@ if not region_mode:
     run = st.button("시세 조회", type="primary", use_container_width=True, on_click=_to_analysis)
     st.button("처음부터 다시 (리셋)", on_click=reset_all, use_container_width=True,
               help="입력값, 선택한 임장지, 조정한 값을 모두 지우고 새로 시작합니다.")
+
+if not region_mode and st.session_state.pop("auc_autorun", False):
+    run = True   # PDF를 올리면 시세 조회를 누른 것처럼 바로 조회
 
 # ───────────────────────── 지역 찾기 화면 ─────────────────────────
 def _analyze_dong(full_region: str, dong: str):
@@ -2053,6 +2209,7 @@ dong = st.selectbox("동네", dongs, key="w_dong")
 
 dong_df = trades[trades["dong"] == dong]
 print_slot = st.container()
+auc_slot = st.container()   # 옥션원 PDF 경매 정보 카드 (예상 매도가 계산 뒤 맨 아래에서 채움)
 
 report = {"fit": [], "verdict": "", "comps": None, "est": None, "route": None, "bld": None, "ck": None,
           "calc": None, "rent": None, "loc": None, "weather": None, "food": None, "life": None, "slope": None, "land": None,
@@ -2136,6 +2293,19 @@ if vworld_key and _pnu:
     elif isinstance(_ap, str):
         aph = {"error": _ap}
         fetch_aphus.clear()   # 실패 결과는 기억하지 않고 다음에 다시 시도
+
+# 옥션원 PDF: 지금 보는 주소와 같은 물건일 때만 씀
+auc = st.session_state.get("auc")
+if auc and re.sub(r"\s+", "", auc.get("addr", "")) not in re.sub(r"\s+", "", st.session_state.get("addr", "")):
+    auc = None
+# 브이월드가 안 될 때(스트림릿 사이트·휴대폰) PDF의 공시가격으로 대신함
+if auc and auc.get("pub") and (aph is None or "error" in aph or not len(aph.get("mine", []))):
+    _p = float(auc["pub"])
+    aph = dict(year=auc.get("pub_year") or date.today().year, how="옥션원 PDF",
+               latest=pd.DataFrame(columns=["ho", "dong_nm", "area", "price"]),
+               mine=pd.DataFrame({"ho": [auc.get("ho", "")], "price": [_p], "area": [auc.get("area")]}),
+               hist=pd.Series(dtype=float), price=_p, low=_p, high=_p, cap=_p * GUARANTEE_RATE)
+    report["aphus"] = dict(year=aph["year"], how=aph["how"], price=_p, low=_p, high=_p, cap=aph["cap"], n=1)
 
 # ── 동네 프로필
 with tab1:
@@ -2233,7 +2403,8 @@ with tab2:
     cand["lon"] = cand["q"].map(lambda q: (geo.get(q) or [None, None])[1])
     cand = cand.dropna(subset=["lat", "lon"])
     cand["dist_m"] = [haversine_m(lat0, lon0, a, b) for a, b in zip(cand["lat"], cand["lon"])]
-    comps = cand[cand["dist_m"] <= radius].sort_values("dist_m")
+    # 최근 거래일 순(같은 날이면 가까운 곳 먼저)
+    comps = cand[cand["dist_m"] <= radius].sort_values(["deal_date", "dist_m"], ascending=[False, True])
     st.session_state.comps = comps
 
     st.write(f"반경 {radius}m · 전용 {area_py:.1f}±{area_tol}평 · 연식 {age}±{age_tol}년 → **{len(comps)}건**")
@@ -2290,7 +2461,7 @@ with tab2:
             column_config={"임장": st.column_config.CheckboxColumn("임장", width="small")})
         # 건물별 카카오맵·로드뷰 (같은 창으로 열려 '뒤로가기'로 바로 돌아옴)
         with st.expander("🗺 건물별 카카오맵 · 로드뷰 (새 탭으로 열기)", expanded=not secret("KAKAO_JS_KEY")):
-            blds = comps.drop_duplicates("q")
+            blds = comps.drop_duplicates("q").sort_values("dist_m")   # 건물 목록은 가까운 순
             st.markdown(html_table([
                 {"건물": n, "거리": f"{d:.0f}m", "지도": "", "로드뷰": "",
                  "_map": kakao_map_link(n, a_, o_), "_rv": kakao_roadview_link(a_, o_)}
@@ -2771,7 +2942,7 @@ with tab4:
     st.markdown("#### 공시가격 (공동주택)")
     with st.expander("📖 공시가격을 경매에서 쓰는 법"):
         st.markdown(APHUS_GUIDE)
-    if not vworld_key:
+    if not vworld_key and aph is None:
         st.caption("브이월드 키를 넣으면 호실별 공시가격이 나옵니다.")
     elif aph is None:
         st.caption("지번을 확인할 수 없어 공시가격을 조회하지 못했습니다.")
@@ -2820,7 +2991,10 @@ with tab4:
                     x=alt.X("연도:O", title=None), y=alt.Y("공시가격(만):Q", scale=alt.Scale(zero=False)),
                     tooltip=["연도", "공시가격(만)"]).properties(height=180), use_container_width=True)
                 st.caption("이 호실의 연도별 공시가격 추이")
-        with st.expander(f"이 건물 전체 호실 공시가격 ({aph['year']}년)"):
+        if aph["how"] == "옥션원 PDF":
+            st.caption("브이월드 조회가 안 되어 옥션원 PDF의 공시가격을 썼습니다(집 컴퓨터에서는 호실별 전체 목록도 나옵니다).")
+        if len(aph["latest"]):
+          with st.expander(f"이 건물 전체 호실 공시가격 ({aph['year']}년)"):
             lt = aph["latest"].sort_values("ho", key=lambda c: c.map(lambda h: (len(h), h)))
             st.dataframe(pd.DataFrame({
                 "호": (lt["dong_nm"] + " " + lt["ho"] + "호").str.strip(), "전용(㎡)": lt["area"],
@@ -3408,6 +3582,34 @@ def build_report_html() -> str:
 <tr><th>층</th><td>{floor}층</td><th>최저가</th><td>{won(min_bid)}</td></tr></table>
 <h2>동네 프로필 · {e(dong)} ({report.get('n_dong', 0)}건)</h2>
 <table><tr><th>항목</th><th>이 물건 구간</th><th>거래 비중</th><th>순위</th><th>가장 많이 팔린 구간</th></tr>"""]
+    au = report.get("auc")
+    if au:
+        h = [f"<h2>경매 정보 · {e(au['case'])}</h2>"]
+        if au.get("photos"):
+            h.append("<div style='display:flex;gap:4px;margin:2px 0 4px'>" + "".join(
+                f"<img src='data:image/jpeg;base64,{ph}' style='width:32%;height:110px;object-fit:cover;border-radius:3px'>" for ph in au["photos"]) + "</div>")
+        h.append(f"<table><tr><th>법원·매각기일</th><td>{e(au.get('court', '').split('(')[0])} · <b>{e(au.get('date', ''))}</b></td>"
+                 f"<th>감정가</th><td>{won(au['appraisal'] / 1e4) if au.get('appraisal') else '-'}</td></tr>"
+                 f"<tr><th>말소기준권리</th><td>{e(au.get('base_right') or '-')}</td><th>입찰보증금</th>"
+                 f"<td>{won(au['deposit'] / 1e4) if au.get('deposit') else '-'}</td></tr></table>")
+        if au.get("rounds"):
+            h.append("<table><tr><th>차수</th><th>매각기일</th><th>최저가</th><th>감정가 대비</th><th>내 최대 입찰가로</th></tr>")
+            for r in au["rounds"]:
+                ok = au.get("bid") is not None and r["price"] / 1e4 <= au["bid"]
+                pct = f"{r['price'] / au['appraisal'] * 100:.0f}%" if au.get("appraisal") else "-"
+                mark = ("<b class='hi'>입찰 가능</b>" if ok else "최저가가 더 높음") if au.get("bid") is not None else "-"
+                h.append(f"<tr><td>{r['n']}차 {e(r['result'])}</td><td>{e(r['date'])}</td><td class='num'>{won(r['price'] / 1e4)}</td>"
+                         f"<td class='num'>{pct}</td><td>{mark}</td></tr>")
+            h.append("</table>")
+        stt = next((x for x in au.get("stats", []) if x["period"] == "최근1년간"), None)
+        if stt and au.get("appraisal"):
+            h.append(f"<div class='box'>이 동네 같은 종류 경매(최근 1년 {stt['n']}건): 낙찰가율 <b>{stt['rate']:.1f}%</b>, "
+                     f"유찰 {stt['fails']:.1f}회, 입찰자 {stt['bidders']:.1f}명 → 평균대로면 약 "
+                     f"<b>{won(au['appraisal'] * stt['rate'] / 100 / 1e4)}</b>에 낙찰</div>")
+        for lv, msg in au.get("risks", []):
+            cls = "box warn" if lv in ("err", "warn") else "box good" if lv == "good" else "box"
+            h.append(f"<div class='{cls}'>{e(msg)}</div>")
+        parts[0] = parts[0].replace("<h2>동네 프로필", "".join(h) + "<h2>동네 프로필", 1)
     for name, label, share, rank, top in report["fit"]:
         parts.append(f"<tr><td>{e(name)}</td><td>{e(label)}</td><td class='num'>{share:.0f}%</td>"
                      f"<td class='num'>{rank}위</td><td>{e(top)}</td></tr>")
@@ -3575,6 +3777,64 @@ def build_report_html() -> str:
     parts.append("</body></html>")
     return "".join(parts)
 
+
+# ── 옥션원 PDF 경매 정보 카드 (맨 위 자리에 채움)
+if auc:
+    with auc_slot:
+        with st.expander(f"📄 경매 정보 · {auc['case']} (옥션원 PDF)", expanded=True):
+            if auc.get("photos"):
+                pc = st.columns(min(len(auc["photos"]), 4))
+                for i_, ph in enumerate(auc["photos"][:4]):
+                    pc[i_].image(ph, use_container_width=True)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("매각기일", auc.get("date") or "-", auc.get("court", "").split("(")[0], delta_color="off")
+            k2.metric("감정가", won(auc["appraisal"] / 1e4) if auc.get("appraisal") else "-")
+            cur = next((r for r in auc["rounds"] if abs(r["price"] - auc.get("min_price", 0)) < 1), None)
+            k3.metric("현재 최저가", won(auc["min_price"] / 1e4) if auc.get("min_price") else "-",
+                      f"{cur['n']}차 · 감정가의 {auc.get('min_pct') or 0}%" if cur else None, delta_color="off")
+            k4.metric("입찰보증금", won(auc["deposit"] / 1e4) if auc.get("deposit") else "-",
+                      f"최저가의 {auc.get('deposit_pct') or 10}%", delta_color="off")
+
+            r_e = report.get("est") or {}
+            bid_m = r_e.get("bid")
+            if auc["rounds"]:
+                rows_a = []
+                for r in auc["rounds"]:
+                    ok = bid_m is not None and r["price"] / 1e4 <= bid_m
+                    rows_a.append({"차수": f"{r['n']}차", "매각기일": r["date"], "최저가": won(r["price"] / 1e4),
+                                   "감정가 대비": f"{r['price'] / auc['appraisal'] * 100:.0f}%" if auc.get("appraisal") else "-",
+                                   "결과": r["result"] or "",
+                                   "내 최대 입찰가로": ("✅ 입찰 가능" if ok else "❌ 최저가가 더 높음") if bid_m is not None else "-"})
+                st.dataframe(pd.DataFrame(rows_a), hide_index=True, use_container_width=True)
+                if bid_m is not None:
+                    first_ok = next((r for r in auc["rounds"] if r["price"] / 1e4 <= bid_m), None)
+                    if first_ok:
+                        st.success(f"최대 입찰가 **{won(bid_m)}** 기준으로 **{first_ok['n']}차({first_ok['date']}, 최저가 "
+                                   f"{won(first_ok['price'] / 1e4)})**부터 입찰할 수 있습니다.")
+                    else:
+                        st.error(f"최대 입찰가 {won(bid_m)}가 표에 있는 모든 차수의 최저가보다 낮습니다. "
+                                 "예상 매도가를 다시 보거나 더 유찰되기를 기다리세요.")
+            stt = next((x for x in auc.get("stats", []) if x["period"] == "최근1년간"), None)
+            if stt and auc.get("appraisal"):
+                exp_w = auc["appraisal"] * stt["rate"] / 100
+                st.info(f"**이 동네 같은 종류 경매(최근 1년 {stt['n']}건)**: 낙찰가율 평균 **{stt['rate']:.1f}%**, "
+                        f"유찰 {stt['fails']:.1f}회, 입찰자 {stt['bidders']:.1f}명. "
+                        f"이 물건도 평균대로라면 약 **{won(exp_w / 1e4)}**에 낙찰될 것으로 볼 수 있습니다"
+                        + (f" (내 최대 입찰가 {won(bid_m)})." if bid_m is not None else "."))
+            for lv, msg in auc.get("risks", []):
+                {"err": st.error, "warn": st.warning, "good": st.success}.get(lv, st.info)(msg)
+            with st.expander("권리·임차인·현장 내용 (PDF 원문)"):
+                st.markdown(
+                    f"- **말소기준권리**: {auc.get('base_right') or '-'} · **배당요구종기**: {auc.get('claim_end') or '-'} · "
+                    f"**채권액 합계**: {won(auc['debt_total'] / 1e4) if auc.get('debt_total') else '-'}\n"
+                    f"- **임차인**: {auc.get('tenants') or '-'}\n"
+                    f"- **기타사항**: {auc.get('note') or '-'}\n"
+                    f"- **주의사항**: {auc.get('caution') or '-'}\n"
+                    f"- **가까운 역**: {', '.join(auc.get('stations', [])) or '-'}")
+                st.caption("PDF에서 글자를 뽑은 것이라 줄바꿈이 어색할 수 있습니다. 권리 판단은 매각물건명세서 원본으로 하세요.")
+    import base64 as _b64
+    report["auc"] = dict(auc, photos=[_b64.b64encode(x).decode() for x in auc.get("photos", [])[:3]],
+                         bid=(report.get("est") or {}).get("bid"))
 
 report_html = build_report_html()
 with print_slot:
